@@ -1,0 +1,12 @@
+# Ignore Python virtual environment
+venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+service_account.json
+credentials.json
+token.pkl
+token.pickle
+appointments.json
+.env
