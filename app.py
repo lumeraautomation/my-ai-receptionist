@@ -1,6 +1,5 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import os
 from datetime import datetime, timedelta
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS for all origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,9 +53,9 @@ class LumeraChatMessage(BaseModel):
 # -----------------------
 def reset_booking():
     return {
-        "service": None,
-        "time": None,
         "name": None,
+        "business": None,
+        "time": None,
         "time_suggestion": None,
         "time_confirmed": False,
         "cancelling": False,
@@ -126,27 +124,13 @@ def extract_time(text):
         return parsed
     return None
 
-def extract_service(text):
-    service_map = {
-        "deep clean": "Deep Clean",
-        "deep cleaning": "Deep Clean",
-        "house cleaning": "House Cleaning",
-        "cleaning": "House Cleaning",
-        "clean": "House Cleaning",
-    }
-    text_lower = text.lower()
-    for phrase in sorted(service_map, key=len, reverse=True):
-        if phrase in text_lower:
-            return service_map[phrase]
-    return None
-
 def extract_name(text):
-    skip_words = {"cancel", "appointment", "booking", "schedule", "clean", "cleaning", "yes", "no", "sure", "ok"}
+    skip_words = {"cancel", "appointment", "booking", "demo", "call", "schedule", "yes", "no", "sure", "ok"}
     text = text.strip()
     if len(text) > MAX_NAME_LENGTH:
         return None
     text_lower = text.lower()
-    triggers = ["my name is", "name is", "i am", "i'm"]
+    triggers = ["my name is", "name is", "i am", "i'm", "this is"]
     for trigger in triggers:
         if trigger in text_lower:
             name_part = text_lower.split(trigger)[1].strip()
@@ -154,12 +138,21 @@ def extract_name(text):
             if len(words) >= 2:
                 first, last = words[0], words[1]
                 if first not in skip_words and last not in skip_words:
-                    return first.capitalize() + " " + last.capitalize()
+                    return words[0].capitalize() + " " + words[1].capitalize()
     words = text.split()
     if len(words) == 2:
         first, last = words[0].lower(), words[1].lower()
         if first not in skip_words and last not in skip_words:
             return words[0].capitalize() + " " + words[1].capitalize()
+    return None
+
+def extract_business(text):
+    triggers = ["my business is", "i own", "i run", "company is", "business is", "we are", "i work at"]
+    text_lower = text.lower()
+    for trigger in triggers:
+        if trigger in text_lower:
+            part = text_lower.split(trigger)[1].strip()
+            return part.split(".")[0].split(",")[0].strip().title()
     return None
 
 def valid_business_hours(dt):
@@ -181,11 +174,15 @@ def find_next_available(start_dt):
 # -----------------------
 # Calendar actions
 # -----------------------
-def create_calendar_event(service, name, booking_time, service_type):
-    end_time = booking_time + timedelta(hours=2)
+def create_demo_event(service, name, business, booking_time):
+    end_time = booking_time + timedelta(hours=1)
     event = {
-        "summary": f"{service_type} - {name}",
-        "description": f"Booked via Lumera AI chatbot.\nService: {service_type}\nClient: {name}",
+        "summary": f"Lumera Demo Call - {name}",
+        "description": (
+            f"Demo call booked via Lumera AI chatbot.\n"
+            f"Name: {name}\n"
+            f"Business: {business or 'Not provided'}\n"
+        ),
         "start": {
             "dateTime": booking_time.isoformat(),
             "timeZone": "America/Chicago",
@@ -198,7 +195,7 @@ def create_calendar_event(service, name, booking_time, service_type):
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created.get("htmlLink")
 
-def cancel_calendar_event(service, name):
+def cancel_demo_event(service, name):
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
         calendarId=CALENDAR_ID,
@@ -232,27 +229,50 @@ def get_ai_response(history, system_prompt):
 # -----------------------
 # System prompt
 # -----------------------
-SYSTEM_PROMPT = """You are Lumera, a friendly AI receptionist for a professional cleaning company.
+SYSTEM_PROMPT = """You are Lumera, a friendly and professional AI sales assistant for Lumera Automation — a company that sells AI chatbot widgets to service businesses.
 
-You help customers with:
-1. Booking house cleaning or deep cleaning appointments
-2. Cancelling existing appointments
-3. Answering questions about services, pricing, and availability
+Your job is to:
+1. Answer FAQs about Lumera Automation's product and services
+2. Qualify leads by understanding their business type and needs
+3. Explain pricing clearly
+4. Book free 30-minute strategy/demo calls
+5. Cancel existing demo calls when requested
 
-Services offered:
-- House Cleaning: Regular maintenance cleaning. $120–$180 depending on home size.
-- Deep Clean: Thorough top-to-bottom cleaning. $200–$300 depending on home size.
+== ABOUT LUMERA AUTOMATION ==
+Lumera Automation builds AI-powered chat widgets that help service businesses:
+- Respond instantly to leads 24/7
+- Book appointments automatically
+- Qualify leads and follow up
+- Sync with Google Calendar
 
-Business hours: Monday–Friday, 9am–5pm (Central Time)
+Target customers: home services, cleaning companies, landscaping, HVAC, medspas, salons, consultants, agencies, and any local service business.
 
-When booking, you need to collect:
-- The service type (house cleaning or deep clean)
-- Their preferred date and time
+== PRICING ==
+- One-Time Setup Fee: $249
+- Monthly Subscription: $79/month
+- Includes: instant AI responses, smart booking, automated follow-ups, calendar sync
+
+== QUALIFYING QUESTIONS ==
+When someone shows interest, naturally ask:
+- What type of business do they run?
+- Are they currently losing leads or missing follow-ups?
+- How are they currently handling bookings?
+
+Use their answers to explain how Lumera solves their specific problem before pushing the demo.
+
+== BOOKING A DEMO ==
+When someone wants to book a demo, collect:
 - Their full name
+- Their business name (optional but helpful)
+- Preferred date and time (Mon-Fri, 9am-5pm Central)
 
-When cancelling, you need their full name to find the appointment.
+Demo calls are 30 minutes and free.
 
-Be warm, professional, and concise. If a customer asks something outside your scope, politely let them know you can help with bookings and service questions."""
+== CANCELLING ==
+If someone wants to cancel, get their full name to find the booking.
+
+== TONE ==
+Be warm, confident, and conversational. Don't be pushy. Focus on understanding their pain points first, then show how Lumera solves them. Keep responses concise — 2-4 sentences max unless explaining pricing or features."""
 
 
 # -----------------------
@@ -265,7 +285,6 @@ def home():
 
 @app.post("/chat")
 async def chat(body: LumeraChatMessage):
-    # Validate message length
     if len(body.message) > MAX_MESSAGE_LENGTH:
         raise HTTPException(status_code=400, detail="Message too long.")
 
@@ -276,10 +295,8 @@ async def chat(body: LumeraChatMessage):
 
     logger.info(f"[{session_id}] User: {user_message}")
 
-    # Add user message to history
     history.append({"role": "user", "content": user_message})
 
-    # Trim history if too long
     if len(history) > MAX_HISTORY_LENGTH:
         history = history[-MAX_HISTORY_LENGTH:]
         session["history"] = history
@@ -287,7 +304,7 @@ async def chat(body: LumeraChatMessage):
     reply = None
 
     # --- Cancellation flow ---
-    cancel_keywords = ["cancel", "cancell", "remove my appointment", "delete my booking"]
+    cancel_keywords = ["cancel", "remove my call", "delete my demo", "cancel my booking", "cancel my demo"]
     if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
         booking["cancelling"] = True
 
@@ -297,31 +314,30 @@ async def chat(body: LumeraChatMessage):
                 booking["cancellation_name"] = name
                 try:
                     cal_service = get_calendar_service()
-                    cancelled = cancel_calendar_event(cal_service, name)
+                    cancelled = cancel_demo_event(cal_service, name)
                     if cancelled:
-                        reply = f"Done! I've cancelled the appointment for {name}. Let me know if there's anything else I can help with!"
+                        reply = f"Done! I've cancelled the demo call for {name}. Feel free to rebook anytime — just let me know!"
                     else:
-                        reply = f"I couldn't find an upcoming appointment for {name}. Could you double-check the name, or give us a call to sort it out?"
+                        reply = f"I couldn't find an upcoming demo for {name}. Could you double-check the name used when booking?"
                 except Exception as e:
                     logger.error(f"Calendar cancellation error: {e}")
                     reply = "I had trouble accessing the calendar. Please try again in a moment."
                 booking["cancelling"] = False
                 booking["cancellation_name"] = None
             else:
-                reply = "Sure, I can help cancel your appointment. Could you give me the full name the booking is under?"
+                reply = "Sure, I can cancel your demo call. What's the full name it was booked under?"
 
     # --- Booking flow ---
     if reply is None:
-        # Extract info from message
-        if not booking["service"]:
-            service = extract_service(user_message)
-            if service:
-                booking["service"] = service
-
         if not booking["name"]:
             name = extract_name(user_message)
             if name:
                 booking["name"] = name
+
+        if not booking["business"]:
+            business = extract_business(user_message)
+            if business:
+                booking["business"] = business
 
         if not booking["time"]:
             dt = extract_time(user_message)
@@ -334,58 +350,52 @@ async def chat(body: LumeraChatMessage):
                     if next_slot:
                         booking["time_suggestion"] = next_slot
                         reply = (
-                            f"That time is outside our business hours (Mon–Fri, 9am–5pm). "
-                            f"The next available slot I can offer is "
-                            f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. Does that work for you?"
+                            f"That time is outside our available hours (Mon-Fri, 9am-5pm CT). "
+                            f"The next available slot is {next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
+                            f"Does that work for you?"
                         )
 
-        # Check if we have all info and confirm
+        # Confirm suggested time
         if booking["time_suggestion"] and not booking["time_confirmed"]:
-            confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great"]
+            confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great", "confirmed"]
             if any(w in user_message.lower() for w in confirm_words):
                 booking["time"] = booking["time_suggestion"]
                 booking["time_confirmed"] = True
 
-        # If all info collected, create the booking
-        if booking["service"] and booking["time"] and booking["name"] and booking["time_confirmed"] and reply is None:
+        # All info collected — create the booking
+        if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
             try:
                 cal_service = get_calendar_service()
-                event_link = create_calendar_event(
+                create_demo_event(
                     cal_service,
                     booking["name"],
-                    booking["time"],
-                    booking["service"]
+                    booking["business"],
+                    booking["time"]
                 )
                 time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                 reply = (
-                    f"You're all set, {booking['name']}! 🎉 "
-                    f"Your {booking['service']} is booked for {time_str} CT. "
-                    f"We'll see you then! Let me know if you need to make any changes."
+                    f"You're all booked, {booking['name']}! 🎉 "
+                    f"Your free 30-minute demo call is set for {time_str} CT. "
+                    f"We'll walk you through everything and show you exactly how Lumera can work for your business. See you then!"
                 )
-                # Reset booking after successful booking
                 session["booking"] = reset_booking()
             except Exception as e:
                 logger.error(f"Calendar booking error: {e}")
-                reply = "I had trouble saving your appointment to the calendar. Please try again in a moment."
+                reply = "I had trouble saving your demo to the calendar. Please try again in a moment."
 
-    # --- Fall back to AI for FAQ / general questions ---
+    # --- AI fallback for FAQs, qualifying, pricing questions ---
     if reply is None:
-        # Build context about current booking state for the AI
         booking_context = ""
-        if booking["service"] or booking["name"] or booking["time_suggestion"]:
-            booking_context = f"\n\nCurrent booking in progress: service={booking['service']}, name={booking['name']}, time={booking['time_suggestion']}"
-            if not booking["service"]:
-                booking_context += "\nStill need: service type"
+        if booking["name"] or booking["time_suggestion"]:
+            booking_context = f"\n\nDemo booking in progress: name={booking['name']}, business={booking['business']}, time={booking['time_suggestion']}, confirmed={booking['time_confirmed']}"
             if not booking["name"]:
-                booking_context += ", full name"
+                booking_context += "\nStill need: full name"
             if not booking["time_suggestion"]:
                 booking_context += ", preferred date/time"
 
         reply = get_ai_response(history, SYSTEM_PROMPT + booking_context)
 
     logger.info(f"[{session_id}] Bot: {reply}")
-
-    # Add bot reply to history
     history.append({"role": "assistant", "content": reply})
 
     return {
