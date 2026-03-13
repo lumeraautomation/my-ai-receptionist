@@ -81,7 +81,7 @@ def extract_time(text):
         text,
         settings={
             "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": datetime.now(),
+            "RELATIVE_BASE": datetime.now(central).replace(tzinfo=None),
             "TIMEZONE": "America/Chicago",
             "RETURN_AS_TIMEZONE_AWARE": True
         }
