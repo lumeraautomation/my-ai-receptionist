@@ -152,7 +152,7 @@ Rules:
 def create_demo_event(service, name, business, booking_time):
     end_time = booking_time + timedelta(hours=1)
     event = {
-        "summary": f"Lumera Demo Call - {name}",
+        "summary": f"Lumera Strategy Call - {name}",
         "description": f"Demo call booked via Lumera AI.\nName: {name}\nBusiness: {business or 'Not provided'}",
         "start": {"dateTime": booking_time.isoformat(), "timeZone": "America/Chicago"},
         "end": {"dateTime": end_time.isoformat(), "timeZone": "America/Chicago"},
