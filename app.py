@@ -45,7 +45,8 @@ def reset_booking():
         "time_suggestion": None,
         "time_confirmed": False,
         "cancelling": False,
-        "cancellation_name": None
+        "cancellation_name": None,
+        "cancellation_time": None
     }
 
 def get_session(session_id: str | None):
@@ -77,6 +78,8 @@ CALENDAR_ID = os.getenv("CALENDAR_ID")
 
 
 def extract_time(text):
+    if not text:
+        return None
     parsed = dateparser.parse(
         text,
         settings={
@@ -112,7 +115,6 @@ def find_next_available(start_dt):
 
 
 def extract_booking_info_with_ai(message, booking):
-    """Use AI to extract name, business, and time from the user message."""
     client = get_openai_client()
     prompt = f"""Extract booking information from this message. Return ONLY valid JSON, no other text.
 
@@ -130,7 +132,7 @@ Return JSON with these fields (use null if not found):
 }}
 
 Rules:
-- name must be a full name (first + last). Do not return single words or generic words like "demo", "call", "yes", "book".
+- name must be a full name (first + last). Do not return single words or generic words like "strategy", "call", "yes", "book", "cancel".
 - business is optional
 - time_text is the raw date/time string from the message if any"""
 
@@ -149,27 +151,39 @@ Rules:
         return {"name": None, "business": None, "time_text": None}
 
 
-def create_demo_event(service, name, business, booking_time):
+def create_strategy_call_event(service, name, business, booking_time):
     end_time = booking_time + timedelta(hours=1)
     event = {
         "summary": f"Lumera Strategy Call - {name}",
-        "description": f"Demo call booked via Lumera AI.\nName: {name}\nBusiness: {business or 'Not provided'}",
+        "description": f"Strategy call booked via Lumera AI.\nName: {name}\nBusiness: {business or 'Not provided'}",
         "start": {"dateTime": booking_time.isoformat(), "timeZone": "America/Chicago"},
         "end": {"dateTime": end_time.isoformat(), "timeZone": "America/Chicago"},
     }
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created.get("htmlLink")
 
-def cancel_demo_event(service, name):
+
+def cancel_strategy_call_event(service, name, cancel_dt=None):
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
         calendarId=CALENDAR_ID, timeMin=now,
-        maxResults=20, singleEvents=True, orderBy="startTime"
+        maxResults=50, singleEvents=True, orderBy="startTime"
     ).execute()
     for event in events_result.get("items", []):
-        if name.lower() in event.get("summary", "").lower():
-            service.events().delete(calendarId=CALENDAR_ID, eventId=event["id"]).execute()
-            return True
+        summary = event.get("summary", "").lower()
+        name_match = name.lower() in summary
+        if not name_match:
+            continue
+        # If a specific time was provided, match it
+        if cancel_dt:
+            event_start = event.get("start", {}).get("dateTime", "")
+            if event_start:
+                event_dt = datetime.fromisoformat(event_start)
+                time_match = abs((event_dt - cancel_dt).total_seconds()) < 3600
+                if not time_match:
+                    continue
+        service.events().delete(calendarId=CALENDAR_ID, eventId=event["id"]).execute()
+        return True
     return False
 
 
@@ -189,11 +203,12 @@ Your job:
 1. Answer FAQs about Lumera Automation
 2. Qualify leads by asking about their business and pain points
 3. Explain pricing
-4. Help book free 30-minute demo calls
-5. Cancel demo calls when asked
+4. Help book free 30-minute strategy calls
+5. Cancel strategy calls when asked
 
 == ABOUT LUMERA AUTOMATION ==
 We build AI chat widgets that help service businesses respond instantly 24/7, book appointments automatically, qualify leads, and sync with Google Calendar.
+The chatbot the user is talking to RIGHT NOW is a live example of what we build for clients.
 Target customers: home services, cleaning, landscaping, HVAC, medspas, salons, consultants, agencies, local businesses.
 
 == PRICING ==
@@ -201,14 +216,31 @@ Target customers: home services, cleaning, landscaping, HVAC, medspas, salons, c
 - Monthly: $79/month
 - Includes: instant AI responses, smart booking, automated follow-ups, calendar sync
 
-== BOOKING RULES — CRITICAL ==
-- NEVER say the booking is confirmed or scheduled. The backend handles that.
-- Collect name, optional business, and preferred time (Mon-Fri 9am-5pm CT).
+== QUALIFYING ==
+When someone shows interest, naturally ask:
+- What type of business do they run?
+- Are they losing leads or missing follow-ups?
+- How are they currently handling bookings?
+Use their answers to show how Lumera solves their specific problem.
+
+== BOOKING A STRATEGY CALL ==
+When someone wants to book, collect:
+- Their full name
+- Their business name (optional)
+- Preferred date and time (Mon-Fri, 9am-5pm CT)
+
+Strategy calls are 30 minutes and free. We'll discuss their business and show how Lumera can help.
+
+CRITICAL BOOKING RULES:
+- NEVER say the call is confirmed or booked. The backend handles that.
 - Once you have name + time, ask: "Just to confirm — [name] on [date] at [time] CT. Does that work?"
-- Wait for yes/no. Do NOT announce the booking yourself.
+- Wait for yes/no before anything else.
 
 == CANCELLING ==
-Ask for their full name. Do not confirm the cancellation yourself.
+When someone wants to cancel, ask for:
+- Their full name
+- The date and time of the call (so we can find the right one if they have multiple)
+Do NOT confirm the cancellation yourself — the backend handles it.
 
 == TONE ==
 Warm, confident, conversational. 2-4 sentences max.""" + booking_context
@@ -246,33 +278,42 @@ async def chat(body: LumeraChatMessage):
     reply = None
 
     # --- Cancellation flow ---
-    cancel_keywords = ["cancel", "remove my call", "delete my demo", "cancel my booking", "cancel my demo"]
+    cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
     if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
         booking["cancelling"] = True
-        if not booking.get("cancellation_name"):
-            extracted = extract_booking_info_with_ai(user_message, booking)
-            name = extracted.get("name")
-            if name:
-                booking["cancellation_name"] = name
-                try:
-                    cal_service = get_calendar_service()
-                    cancelled = cancel_demo_event(cal_service, name)
-                    reply = (
-                        f"Done! I've cancelled the demo for {name}. Feel free to rebook anytime!"
-                        if cancelled else
-                        f"I couldn't find a demo for {name}. Could you double-check the name?"
-                    )
-                except Exception as e:
-                    logger.error(f"Cancel error: {e}")
-                    reply = "I had trouble accessing the calendar. Please try again."
-                booking["cancelling"] = False
-                booking["cancellation_name"] = None
-            else:
-                reply = "Sure! What's the full name the demo was booked under?"
+        extracted = extract_booking_info_with_ai(user_message, booking)
+        name = extracted.get("name") or booking.get("cancellation_name")
+        time_text = extracted.get("time_text") or booking.get("cancellation_time")
+
+        if name:
+            booking["cancellation_name"] = name
+        if time_text:
+            booking["cancellation_time"] = time_text
+
+        # Need both name and time to cancel precisely
+        if booking["cancellation_name"] and booking["cancellation_time"]:
+            cancel_dt = extract_time(booking["cancellation_time"])
+            try:
+                cal_service = get_calendar_service()
+                cancelled = cancel_strategy_call_event(cal_service, booking["cancellation_name"], cancel_dt)
+                reply = (
+                    f"Done! I've cancelled the strategy call for {booking['cancellation_name']}. Feel free to rebook anytime!"
+                    if cancelled else
+                    f"I couldn't find a strategy call for {booking['cancellation_name']} at that time. Could you double-check the details?"
+                )
+            except Exception as e:
+                logger.error(f"Cancel error: {e}")
+                reply = "I had trouble accessing the calendar. Please try again."
+            booking["cancelling"] = False
+            booking["cancellation_name"] = None
+            booking["cancellation_time"] = None
+        elif booking["cancellation_name"] and not booking["cancellation_time"]:
+            reply = f"Got it. What date and time is the strategy call you'd like to cancel?"
+        else:
+            reply = "Sure! What's the full name and date/time of the strategy call you'd like to cancel?"
 
     # --- Booking flow ---
     if reply is None:
-        # Use AI to extract name, business, time from message
         extracted = extract_booking_info_with_ai(user_message, booking)
 
         if not booking["name"] and extracted.get("name"):
@@ -305,18 +346,17 @@ async def chat(body: LumeraChatMessage):
             if any(w in user_message.lower() for w in confirm_words):
                 booking["time"] = booking["time_suggestion"]
                 booking["time_confirmed"] = True
-                logger.info("Time confirmed")
 
         # All info collected — create booking
         if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
             try:
                 cal_service = get_calendar_service()
-                create_demo_event(cal_service, booking["name"], booking["business"], booking["time"])
+                create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
                 time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                 reply = (
-                    f"You're all booked, {booking['name']}! 🎉 "
-                    f"Your free 30-minute demo is set for {time_str} CT. "
-                    f"We'll show you exactly how Lumera can work for your business. See you then!"
+                    f"You're all set, {booking['name']}! 🎉 "
+                    f"Your free 30-minute strategy call is booked for {time_str} CT. "
+                    f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
                 )
                 session["booking"] = reset_booking()
             except Exception as e:
