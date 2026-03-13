@@ -139,10 +139,11 @@ def extract_name(text):
                 first, last = words[0], words[1]
                 if first not in skip_words and last not in skip_words:
                     return words[0].capitalize() + " " + words[1].capitalize()
+    import re
     words = text.split()
-    if len(words) == 2:
-        first, last = words[0].lower(), words[1].lower()
-        if first not in skip_words and last not in skip_words:
+    for i in range(len(words) - 1):
+        w1 = re.sub(r'[^a-zA-Z]', '', words[i])
+        kip_words and last not in skip_words:
             return words[0].capitalize() + " " + words[1].capitalize()
     return None
 
