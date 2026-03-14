@@ -212,8 +212,8 @@ The chatbot the user is talking to RIGHT NOW is a live example of what we build 
 Target customers: home services, cleaning, landscaping, HVAC, medspas, salons, consultants, agencies, local businesses.
 
 == PRICING ==
-- One-Time Setup: $249
-- Monthly: $79/month
+- One-Time Setup: $499
+- Monthly: $99/month
 - Includes: instant AI responses, smart booking, automated follow-ups, calendar sync
 
 == QUALIFYING ==
