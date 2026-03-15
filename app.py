@@ -304,6 +304,28 @@ async def get_availability():
         raise HTTPException(status_code=500, detail="Could not fetch availability.")
 
 
+@app.post("/book")
+async def book_slot(body: dict):
+    try:
+        name = body.get("name")
+        business = body.get("business", "")
+        start_time = body.get("start")
+
+        if not name or not start_time:
+            raise HTTPException(status_code=400, detail="Missing name or start time.")
+
+        booking_time = datetime.fromisoformat(start_time).astimezone(central)
+
+        cal_service = get_calendar_service()
+        create_strategy_call_event(cal_service, name, business, booking_time)
+
+        return {"success": True, "message": f"Booked for {booking_time.strftime('%A, %B %d at %I:%M %p')} CT"}
+
+    except Exception as e:
+        logger.error(f"Direct booking error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create booking.")
+
+
 @app.post("/chat")
 async def chat(body: LumeraChatMessage):
     if len(body.message) > MAX_MESSAGE_LENGTH:
