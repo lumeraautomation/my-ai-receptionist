@@ -45,8 +45,7 @@ def reset_booking():
         "time_suggestion": None,
         "time_confirmed": False,
         "cancelling": False,
-        "cancellation_name": None,
-        "cancellation_time": None
+        "cancellation_name": None
     }
 
 def get_session(session_id: str | None):
@@ -78,8 +77,6 @@ CALENDAR_ID = os.getenv("CALENDAR_ID")
 
 
 def extract_time(text):
-    if not text:
-        return None
     parsed = dateparser.parse(
         text,
         settings={
@@ -162,28 +159,16 @@ def create_strategy_call_event(service, name, business, booking_time):
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created.get("htmlLink")
 
-
-def cancel_strategy_call_event(service, name, cancel_dt=None):
+def cancel_strategy_call_event(service, name):
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
         calendarId=CALENDAR_ID, timeMin=now,
-        maxResults=50, singleEvents=True, orderBy="startTime"
+        maxResults=20, singleEvents=True, orderBy="startTime"
     ).execute()
     for event in events_result.get("items", []):
-        summary = event.get("summary", "").lower()
-        name_match = name.lower() in summary
-        if not name_match:
-            continue
-        # If a specific time was provided, match it
-        if cancel_dt:
-            event_start = event.get("start", {}).get("dateTime", "")
-            if event_start:
-                event_dt = datetime.fromisoformat(event_start)
-                time_match = abs((event_dt - cancel_dt).total_seconds()) < 3600
-                if not time_match:
-                    continue
-        service.events().delete(calendarId=CALENDAR_ID, eventId=event["id"]).execute()
-        return True
+        if name.lower() in event.get("summary", "").lower():
+            service.events().delete(calendarId=CALENDAR_ID, eventId=event["id"]).execute()
+            return True
     return False
 
 
@@ -237,10 +222,7 @@ CRITICAL BOOKING RULES:
 - Wait for yes/no before anything else.
 
 == CANCELLING ==
-When someone wants to cancel, ask for:
-- Their full name
-- The date and time of the call (so we can find the right one if they have multiple)
-Do NOT confirm the cancellation yourself — the backend handles it.
+Ask for their full name. Do not confirm the cancellation yourself.
 
 == TONE ==
 Warm, confident, conversational. 2-4 sentences max.""" + booking_context
@@ -257,6 +239,69 @@ Warm, confident, conversational. 2-4 sentences max.""" + booking_context
 @app.get("/")
 def home():
     return {"message": "Lumera Automation is running!"}
+
+
+@app.get("/availability")
+async def get_availability():
+    try:
+        cal_service = get_calendar_service()
+        now = datetime.now(central)
+
+        # Look 14 days ahead
+        time_min = now.isoformat()
+        time_max = (now + timedelta(days=14)).isoformat()
+
+        # Get existing events (busy times)
+        events_result = cal_service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+
+        busy_times = []
+        for event in events_result.get("items", []):
+            start = event["start"].get("dateTime")
+            end = event["end"].get("dateTime")
+            if start and end:
+                busy_times.append({
+                    "start": start,
+                    "end": end
+                })
+
+        # Generate all possible 1-hour slots (Mon-Fri, 9am-4pm CT)
+        available_slots = []
+        current = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+        while current <= now + timedelta(days=14):
+            # Only Mon-Fri, 9am-4pm (last slot starts at 4pm, ends 5pm)
+            if 0 <= current.weekday() <= 4 and 9 <= current.hour <= 16:
+                slot_end = current + timedelta(hours=1)
+
+                # Check if slot overlaps with any busy time
+                is_busy = False
+                for busy in busy_times:
+                    busy_start = datetime.fromisoformat(busy["start"]).astimezone(central)
+                    busy_end = datetime.fromisoformat(busy["end"]).astimezone(central)
+                    if current < busy_end and slot_end > busy_start:
+                        is_busy = True
+                        break
+
+                if not is_busy:
+                    available_slots.append({
+                        "start": current.isoformat(),
+                        "end": slot_end.isoformat(),
+                        "display": current.strftime("%A, %B %d at %I:%M %p") + " CT"
+                    })
+
+            current += timedelta(hours=1)
+
+        return {"slots": available_slots}
+
+    except Exception as e:
+        logger.error(f"Availability error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch availability.")
 
 
 @app.post("/chat")
@@ -281,36 +326,26 @@ async def chat(body: LumeraChatMessage):
     cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
     if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
         booking["cancelling"] = True
-        extracted = extract_booking_info_with_ai(user_message, booking)
-        name = extracted.get("name") or booking.get("cancellation_name")
-        time_text = extracted.get("time_text") or booking.get("cancellation_time")
-
-        if name:
-            booking["cancellation_name"] = name
-        if time_text:
-            booking["cancellation_time"] = time_text
-
-        # Need both name and time to cancel precisely
-        if booking["cancellation_name"] and booking["cancellation_time"]:
-            cancel_dt = extract_time(booking["cancellation_time"])
-            try:
-                cal_service = get_calendar_service()
-                cancelled = cancel_strategy_call_event(cal_service, booking["cancellation_name"], cancel_dt)
-                reply = (
-                    f"Done! I've cancelled the strategy call for {booking['cancellation_name']}. Feel free to rebook anytime!"
-                    if cancelled else
-                    f"I couldn't find a strategy call for {booking['cancellation_name']} at that time. Could you double-check the details?"
-                )
-            except Exception as e:
-                logger.error(f"Cancel error: {e}")
-                reply = "I had trouble accessing the calendar. Please try again."
-            booking["cancelling"] = False
-            booking["cancellation_name"] = None
-            booking["cancellation_time"] = None
-        elif booking["cancellation_name"] and not booking["cancellation_time"]:
-            reply = f"Got it. What date and time is the strategy call you'd like to cancel?"
-        else:
-            reply = "Sure! What's the full name and date/time of the strategy call you'd like to cancel?"
+        if not booking.get("cancellation_name"):
+            extracted = extract_booking_info_with_ai(user_message, booking)
+            name = extracted.get("name")
+            if name:
+                booking["cancellation_name"] = name
+                try:
+                    cal_service = get_calendar_service()
+                    cancelled = cancel_strategy_call_event(cal_service, name)
+                    reply = (
+                        f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                        if cancelled else
+                        f"I couldn't find a strategy call for {name}. Could you double-check the name?"
+                    )
+                except Exception as e:
+                    logger.error(f"Cancel error: {e}")
+                    reply = "I had trouble accessing the calendar. Please try again."
+                booking["cancelling"] = False
+                booking["cancellation_name"] = None
+            else:
+                reply = "Sure! What's the full name the strategy call was booked under?"
 
     # --- Booking flow ---
     if reply is None:
