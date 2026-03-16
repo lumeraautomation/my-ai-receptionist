@@ -9,6 +9,7 @@ import pytz
 import uuid
 import logging
 import json
+import sqlite3
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -31,6 +32,49 @@ sessions: dict = {}
 MAX_MESSAGE_LENGTH = 500
 MAX_HISTORY_LENGTH = 20
 
+# ── Analytics ─────────────────────────────────────────────────────────────────
+# Each client deployment sets CLIENT_ID in their environment variables.
+# e.g. CLIENT_ID=bloom_wellness  or  CLIENT_ID=peak_fitness
+CLIENT_ID = os.getenv("CLIENT_ID", "lumera_demo")
+DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics.db")
+
+
+def init_db():
+    """Create the analytics table if it doesn't exist yet."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                client_id  TEXT NOT NULL,
+                timestamp  TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def log_event(event_type: str, session_id: str):
+    """
+    Log a single analytics event to SQLite.
+    event_type: 'widget_view' | 'booking_created' | 'booking_cancelled'
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO events (event_type, session_id, client_id, timestamp) VALUES (?, ?, ?, ?)",
+                (event_type, session_id, CLIENT_ID, datetime.now(central).isoformat())
+            )
+            conn.commit()
+        logger.info(f"[analytics] {event_type} | client={CLIENT_ID} | session={session_id}")
+    except Exception as e:
+        logger.error(f"[analytics] Failed to log event: {e}")
+
+
+# Initialise the database when the app starts
+init_db()
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 class LumeraChatMessage(BaseModel):
     message: str
@@ -48,11 +92,14 @@ def reset_booking():
         "cancellation_name": None
     }
 
+
 def get_session(session_id: str | None):
     if not session_id:
         session_id = str(uuid.uuid4())
     if session_id not in sessions:
         sessions[session_id] = {"booking": reset_booking(), "history": []}
+        # New session = widget was opened — count as a view
+        log_event("widget_view", session_id)
     return session_id, sessions[session_id]
 
 
@@ -95,8 +142,10 @@ def extract_time(text):
         return parsed
     return None
 
+
 def valid_business_hours(dt):
     return 0 <= dt.weekday() <= 4 and 9 <= dt.hour < 17
+
 
 def find_next_available(start_dt):
     dt = start_dt
@@ -159,6 +208,7 @@ def create_strategy_call_event(service, name, business, booking_time):
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created.get("htmlLink")
 
+
 def cancel_strategy_call_event(service, name):
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
@@ -214,7 +264,7 @@ When someone wants to book, collect:
 - Their business name (optional)
 - Preferred date and time (Mon-Fri, 9am-5pm CT)
 
-Strategy calls are 30 minutes and free. We'll discuss their business and show how Lumera can help.
+Strategy calls are 30 minutes and free. We'll discuss their business and show how Lumera can work for you.
 
 CRITICAL BOOKING RULES:
 - NEVER say the call is confirmed or booked. The backend handles that.
@@ -247,11 +297,9 @@ async def get_availability():
         cal_service = get_calendar_service()
         now = datetime.now(central)
 
-        # Look 14 days ahead
         time_min = now.isoformat()
         time_max = (now + timedelta(days=14)).isoformat()
 
-        # Get existing events (busy times)
         events_result = cal_service.events().list(
             calendarId=CALENDAR_ID,
             timeMin=time_min,
@@ -265,21 +313,14 @@ async def get_availability():
             start = event["start"].get("dateTime")
             end = event["end"].get("dateTime")
             if start and end:
-                busy_times.append({
-                    "start": start,
-                    "end": end
-                })
+                busy_times.append({"start": start, "end": end})
 
-        # Generate all possible 1-hour slots (Mon-Fri, 9am-4pm CT)
         available_slots = []
         current = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
         while current <= now + timedelta(days=14):
-            # Only Mon-Fri, 9am-4pm (last slot starts at 4pm, ends 5pm)
             if 0 <= current.weekday() <= 4 and 9 <= current.hour <= 16:
                 slot_end = current + timedelta(hours=1)
-
-                # Check if slot overlaps with any busy time
                 is_busy = False
                 for busy in busy_times:
                     busy_start = datetime.fromisoformat(busy["start"]).astimezone(central)
@@ -287,14 +328,12 @@ async def get_availability():
                     if current < busy_end and slot_end > busy_start:
                         is_busy = True
                         break
-
                 if not is_busy:
                     available_slots.append({
                         "start": current.isoformat(),
                         "end": slot_end.isoformat(),
                         "display": current.strftime("%A, %B %d at %I:%M %p") + " CT"
                     })
-
             current += timedelta(hours=1)
 
         return {"slots": available_slots}
@@ -304,26 +343,66 @@ async def get_availability():
         raise HTTPException(status_code=500, detail="Could not fetch availability.")
 
 
-@app.post("/book")
-async def book_slot(body: dict):
+# ── Analytics endpoint ─────────────────────────────────────────────────────────
+@app.get("/analytics")
+def get_analytics(client_id: str | None = None):
+    """
+    Returns booking analytics.
+    - Call /analytics            → returns data for this deployment's CLIENT_ID
+    - Call /analytics?client_id=all  → returns combined data across all clients
+      (useful if you ever run a single shared DB)
+    """
     try:
-        name = body.get("name")
-        business = body.get("business", "")
-        start_time = body.get("start")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
 
-        if not name or not start_time:
-            raise HTTPException(status_code=400, detail="Missing name or start time.")
+            # Filter by client unless "all" is requested
+            if client_id == "all":
+                rows = conn.execute("SELECT * FROM events ORDER BY timestamp").fetchall()
+            else:
+                target = client_id or CLIENT_ID
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE client_id = ? ORDER BY timestamp",
+                    (target,)
+                ).fetchall()
 
-        booking_time = datetime.fromisoformat(start_time).astimezone(central)
+        from collections import defaultdict
+        monthly = defaultdict(lambda: {"views": 0, "bookings": 0, "cancellations": 0})
+        total_views = 0
+        total_bookings = 0
+        total_cancellations = 0
 
-        cal_service = get_calendar_service()
-        create_strategy_call_event(cal_service, name, business, booking_time)
+        for row in rows:
+            month = row["timestamp"][:7]  # "2026-03"
+            et = row["event_type"]
+            if et == "widget_view":
+                monthly[month]["views"] += 1
+                total_views += 1
+            elif et == "booking_created":
+                monthly[month]["bookings"] += 1
+                total_bookings += 1
+            elif et == "booking_cancelled":
+                monthly[month]["cancellations"] += 1
+                total_cancellations += 1
 
-        return {"success": True, "message": f"Booked for {booking_time.strftime('%A, %B %d at %I:%M %p')} CT"}
+        conv_rate = round((total_bookings / total_views * 100), 1) if total_views else 0
+
+        # Sort months chronologically
+        sorted_monthly = dict(sorted(monthly.items()))
+
+        return {
+            "client_id": client_id or CLIENT_ID,
+            "total_views": total_views,
+            "total_bookings": total_bookings,
+            "total_cancellations": total_cancellations,
+            "conversion_rate": conv_rate,
+            "monthly": sorted_monthly
+        }
 
     except Exception as e:
-        logger.error(f"Direct booking error: {e}")
-        raise HTTPException(status_code=500, detail="Could not create booking.")
+        logger.error(f"Analytics error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch analytics.")
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 @app.post("/chat")
@@ -356,11 +435,13 @@ async def chat(body: LumeraChatMessage):
                 try:
                     cal_service = get_calendar_service()
                     cancelled = cancel_strategy_call_event(cal_service, name)
-                    reply = (
-                        f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
-                        if cancelled else
-                        f"I couldn't find a strategy call for {name}. Could you double-check the name?"
-                    )
+                    if cancelled:
+                        log_event("booking_cancelled", session_id)  # ← analytics
+                        reply = (
+                            f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                        )
+                    else:
+                        reply = f"I couldn't find a strategy call for {name}. Could you double-check the name?"
                 except Exception as e:
                     logger.error(f"Cancel error: {e}")
                     reply = "I had trouble accessing the calendar. Please try again."
@@ -397,7 +478,6 @@ async def chat(body: LumeraChatMessage):
                             f"Does that work?"
                         )
 
-        # Check for confirmation
         confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great", "confirmed", "yep", "yup"]
         if booking["time_suggestion"] and not booking["time_confirmed"]:
             if any(w in user_message.lower() for w in confirm_words):
@@ -409,6 +489,7 @@ async def chat(body: LumeraChatMessage):
             try:
                 cal_service = get_calendar_service()
                 create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
+                log_event("booking_created", session_id)  # ← analytics
                 time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                 reply = (
                     f"You're all set, {booking['name']}! 🎉 "
