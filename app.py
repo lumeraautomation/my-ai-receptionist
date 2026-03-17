@@ -68,11 +68,22 @@ def init_db():
                 client_id  TEXT NOT NULL,
                 name       TEXT,
                 business   TEXT,
+                email      TEXT,
+                phone      TEXT,
                 source     TEXT DEFAULT 'Chat Widget',
                 status     TEXT NOT NULL DEFAULT 'new',
                 created_at TEXT NOT NULL
             )
         """)
+        # Add email/phone columns if upgrading from older DB
+        try:
+            conn.execute("ALTER TABLE leads ADD COLUMN email TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE leads ADD COLUMN phone TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -642,6 +653,8 @@ async def chat(body: LumeraChatMessage):
 class LeadCreate(BaseModel):
     name: str
     business: str | None = None
+    email: str | None = None
+    phone: str | None = None
     source: str | None = "Manual Entry"
     status: str | None = "new"
 
@@ -654,9 +667,10 @@ def create_lead(body: LeadCreate):
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO leads (session_id, client_id, name, business, email, phone, source, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), CLIENT_ID, body.name, body.business or "",
+                 body.email or "", body.phone or "",
                  body.source or "Manual Entry", body.status,
                  datetime.now(central).isoformat())
             )
@@ -687,11 +701,11 @@ def create_leads_bulk(body: BulkLeadCreate):
                 valid = {"new", "contacted", "qualified", "lost"}
                 status = lead.status if lead.status in valid else "new"
                 conn.execute(
-                    """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO leads (session_id, client_id, name, business, email, phone, source, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (str(uuid.uuid4()), CLIENT_ID, lead.name.strip(),
-                     lead.business or "", lead.source or "CSV Import",
-                     status, now)
+                     lead.business or "", lead.email or "", lead.phone or "",
+                     lead.source or "CSV Import", status, now)
                 )
                 inserted += 1
             conn.commit()
