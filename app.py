@@ -747,6 +747,159 @@ def delete_leads_bulk(body: BulkDeleteRequest):
         raise HTTPException(status_code=500, detail="Could not delete leads.")
 
 
+import hashlib
+import secrets
+
+# ── Users table ───────────────────────────────────────────────────────────────
+def init_users():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                email      TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                name       TEXT,
+                role       TEXT NOT NULL DEFAULT 'staff',
+                active     INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        # Seed default admin from env or fallback
+        default_email = os.getenv("ADMIN_EMAIL", "admin@lumeraautomation.com")
+        default_pass  = os.getenv("ADMIN_PASSWORD", "lumera2026")
+        existing = conn.execute(
+            "SELECT id FROM admin_users WHERE email=?", (default_email,)
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                """INSERT INTO admin_users (email, password_hash, name, role, active, created_at)
+                   VALUES (?, ?, ?, 'admin', 1, ?)""",
+                (default_email, _hash(default_pass), "Admin",
+                 datetime.now(central).isoformat())
+            )
+            conn.commit()
+            logger.info(f"[users] Seeded default admin: {default_email}")
+
+def _hash(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+init_users()
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/auth/login")
+def login(body: LoginRequest):
+    """Validate admin credentials. Returns user info on success."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            user = conn.execute(
+                "SELECT * FROM admin_users WHERE email=? AND active=1",
+                (body.email.strip().lower(),)
+            ).fetchone()
+        if not user or user["password_hash"] != _hash(body.password):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        return {
+            "ok": True,
+            "user": {
+                "id":    user["id"],
+                "email": user["email"],
+                "name":  user["name"],
+                "role":  user["role"],
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed.")
+
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+    role: str | None = "staff"
+
+@app.get("/auth/users")
+def get_users():
+    """List all admin users."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, email, name, role, active, created_at FROM admin_users ORDER BY created_at"
+            ).fetchall()
+        return {"users": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Get users error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch users.")
+
+@app.post("/auth/users")
+def create_user(body: UserCreate):
+    """Add a new admin user."""
+    valid_roles = {"admin", "staff"}
+    if body.role not in valid_roles:
+        raise HTTPException(status_code=400, detail="role must be admin or staff")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO admin_users (email, password_hash, name, role, active, created_at)
+                   VALUES (?, ?, ?, ?, 1, ?)""",
+                (body.email.strip().lower(), _hash(body.password),
+                 body.name or body.email.split("@")[0], body.role,
+                 datetime.now(central).isoformat())
+            )
+            conn.commit()
+        return {"ok": True}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Email already exists.")
+    except Exception as e:
+        logger.error(f"Create user error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create user.")
+
+class UserUpdate(BaseModel):
+    name: str | None = None
+    password: str | None = None
+    role: str | None = None
+    active: int | None = None
+
+@app.patch("/auth/users/{user_id}")
+def update_user(user_id: int, body: UserUpdate):
+    """Update name, password, role, or active status."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if body.name is not None:
+                conn.execute("UPDATE admin_users SET name=? WHERE id=?", (body.name, user_id))
+            if body.password is not None:
+                conn.execute("UPDATE admin_users SET password_hash=? WHERE id=?", (_hash(body.password), user_id))
+            if body.role is not None:
+                conn.execute("UPDATE admin_users SET role=? WHERE id=?", (body.role, user_id))
+            if body.active is not None:
+                conn.execute("UPDATE admin_users SET active=? WHERE id=?", (body.active, user_id))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Update user error: {e}")
+        raise HTTPException(status_code=500, detail="Could not update user.")
+
+@app.delete("/auth/users/{user_id}")
+def delete_user(user_id: int):
+    """Remove an admin user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM admin_users WHERE id=?", (user_id,))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Delete user error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete user.")
+
+
 @app.post("/chat")
 async def chat(body: LumeraChatMessage):
     if len(body.message) > MAX_MESSAGE_LENGTH:
