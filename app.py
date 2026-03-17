@@ -901,14 +901,20 @@ def init_users():
                 name          TEXT,
                 role          TEXT NOT NULL DEFAULT 'staff',
                 client_id     TEXT NOT NULL DEFAULT 'lumera_demo',
+                business_name TEXT,
                 active        INTEGER NOT NULL DEFAULT 1,
                 created_at    TEXT NOT NULL
             )
         """)
         conn.commit()
-        # Migrate: add client_id if upgrading older DB
+        # Migrate: add columns if upgrading older DB
         try:
             conn.execute("ALTER TABLE admin_users ADD COLUMN client_id TEXT NOT NULL DEFAULT 'lumera_demo'")
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE admin_users ADD COLUMN business_name TEXT")
             conn.commit()
         except Exception:
             pass
@@ -961,10 +967,11 @@ def login(body: LoginRequest):
             "ok": True,
             "user": {
                 "id":        user["id"],
-                "email":     user["email"],
-                "name":      user["name"],
-                "role":      user["role"],
-                "client_id": user["client_id"] if "client_id" in user.keys() else "lumera_demo",
+                "email":         user["email"],
+                "name":          user["name"],
+                "role":          user["role"],
+                "client_id":     user["client_id"] if "client_id" in user.keys() else "lumera_demo",
+                "business_name": user["business_name"] if "business_name" in user.keys() else None,
             }
         }
     except HTTPException:
@@ -980,6 +987,7 @@ class UserCreate(BaseModel):
     name: str | None = None
     role: str | None = "staff"
     client_id: str | None = "lumera_demo"
+    business_name: str | None = None
 
 @app.get("/auth/users")
 def get_users():
@@ -988,7 +996,7 @@ def get_users():
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, email, name, role, client_id, active, created_at FROM admin_users ORDER BY created_at"
+                "SELECT id, email, name, role, client_id, business_name, active, created_at FROM admin_users ORDER BY created_at"
             ).fetchall()
         return {"users": [dict(r) for r in rows]}
     except Exception as e:
@@ -1004,11 +1012,12 @@ def create_user(body: UserCreate):
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                """INSERT INTO admin_users (email, password_hash, name, role, client_id, active, created_at)
-                   VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                """INSERT INTO admin_users (email, password_hash, name, role, client_id, business_name, active, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
                 (body.email.strip().lower(), _hash(body.password),
                  body.name or body.email.split("@")[0], body.role,
                  body.client_id or "lumera_demo",
+                 body.business_name or None,
                  datetime.now(central).isoformat())
             )
             conn.commit()
@@ -1024,6 +1033,7 @@ class UserUpdate(BaseModel):
     password: str | None = None
     role: str | None = None
     client_id: str | None = None
+    business_name: str | None = None
     active: int | None = None
 
 @app.patch("/auth/users/{user_id}")
