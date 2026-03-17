@@ -143,6 +143,146 @@ def log_lead(session_id: str, name: str, business: str):
 init_db()
 
 
+# ── Clients table (active paying clients) ─────────────────────────────────────
+def init_clients():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                business     TEXT,
+                email        TEXT,
+                phone        TEXT,
+                status       TEXT NOT NULL DEFAULT 'active',
+                setup_paid   INTEGER NOT NULL DEFAULT 1,
+                monthly_fee  REAL NOT NULL DEFAULT 99.0,
+                setup_fee    REAL NOT NULL DEFAULT 499.0,
+                start_date   TEXT NOT NULL,
+                notes        TEXT,
+                client_id    TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+init_clients()
+
+
+class ClientCreate(BaseModel):
+    name: str
+    business: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    status: str | None = "active"
+    setup_paid: int | None = 1
+    monthly_fee: float | None = 99.0
+    setup_fee: float | None = 499.0
+    start_date: str | None = None
+    notes: str | None = None
+
+class ClientUpdate(BaseModel):
+    name: str | None = None
+    business: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    status: str | None = None
+    setup_paid: int | None = None
+    monthly_fee: float | None = None
+    notes: str | None = None
+
+@app.get("/revenue")
+def get_revenue():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            clients = [dict(c) for c in conn.execute(
+                "SELECT * FROM clients WHERE client_id=? ORDER BY start_date DESC",
+                (CLIENT_ID,)
+            ).fetchall()]
+
+        active  = [c for c in clients if c['status'] == 'active']
+        churned = [c for c in clients if c['status'] == 'churned']
+        trial   = [c for c in clients if c['status'] == 'trial']
+
+        mrr         = sum(c['monthly_fee'] for c in active)
+        setup_total = sum(c['setup_fee'] for c in clients if c['setup_paid'])
+
+        from collections import defaultdict
+        monthly = defaultdict(lambda: {"new_clients": 0, "setup_revenue": 0, "mrr_snapshot": 0})
+        for c in clients:
+            if not c['start_date']:
+                continue
+            month = c['start_date'][:7]
+            if c['setup_paid']:
+                monthly[month]['setup_revenue'] += c['setup_fee']
+            if c['status'] in ('active', 'trial'):
+                monthly[month]['new_clients'] += 1
+
+        running_mrr = 0
+        for m in sorted(monthly.keys()):
+            running_mrr += monthly[m]['new_clients'] * 99
+            monthly[m]['mrr_snapshot'] = running_mrr
+
+        return {
+            "summary": {
+                "mrr":            round(mrr, 2),
+                "arr":            round(mrr * 12, 2),
+                "setup_total":    round(setup_total, 2),
+                "total_revenue":  round(mrr + setup_total, 2),
+                "active_clients": len(active),
+                "trial_clients":  len(trial),
+                "churned_clients":len(churned),
+                "total_clients":  len(clients),
+            },
+            "clients": clients,
+            "monthly": dict(sorted(monthly.items())),
+        }
+    except Exception as e:
+        logger.error(f"Revenue error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch revenue data.")
+
+@app.post("/revenue/clients")
+def create_client(body: ClientCreate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO clients (name, business, email, phone, status, setup_paid,
+                   monthly_fee, setup_fee, start_date, notes, client_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (body.name, body.business or "", body.email or "", body.phone or "",
+                 body.status or "active", 1 if body.setup_paid is None else body.setup_paid,
+                 body.monthly_fee or 99.0, body.setup_fee or 499.0,
+                 body.start_date or datetime.now(central).strftime("%Y-%m-%d"),
+                 body.notes or "", CLIENT_ID)
+            )
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Client create error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create client.")
+
+@app.patch("/revenue/clients/{cid}")
+def update_client(cid: int, body: ClientUpdate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for field, val in body.model_dump(exclude_none=True).items():
+                conn.execute(f"UPDATE clients SET {field}=? WHERE id=? AND client_id=?",
+                             (val, cid, CLIENT_ID))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not update client.")
+
+@app.delete("/revenue/clients/{cid}")
+def delete_client(cid: int):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM clients WHERE id=? AND client_id=?", (cid, CLIENT_ID))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not delete client.")
+
+
 class LumeraChatMessage(BaseModel):
     message: str
     session_id: str | None = None
