@@ -32,33 +32,51 @@ sessions: dict = {}
 MAX_MESSAGE_LENGTH = 500
 MAX_HISTORY_LENGTH = 20
 
-# ── Analytics ─────────────────────────────────────────────────────────────────
-# Each client deployment sets CLIENT_ID in their environment variables.
-# e.g. CLIENT_ID=bloom_wellness  or  CLIENT_ID=peak_fitness
 CLIENT_ID = os.getenv("CLIENT_ID", "lumera_demo")
 DB_PATH = os.getenv("ANALYTICS_DB_PATH", "analytics.db")
 
 
 def init_db():
-    """Create the analytics table if it doesn't exist yet."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 client_id  TEXT NOT NULL,
                 timestamp  TEXT NOT NULL
             )
         """)
+        # NEW: bookings table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bookings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                client_id  TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                business   TEXT,
+                start_time TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'confirmed',
+                created_at TEXT NOT NULL
+            )
+        """)
+        # NEW: leads table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                client_id  TEXT NOT NULL,
+                name       TEXT,
+                business   TEXT,
+                source     TEXT DEFAULT 'Chat Widget',
+                status     TEXT NOT NULL DEFAULT 'new',
+                created_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 
 def log_event(event_type: str, session_id: str):
-    """
-    Log a single analytics event to SQLite.
-    event_type: 'widget_view' | 'booking_created' | 'booking_cancelled'
-    """
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
@@ -71,9 +89,47 @@ def log_event(event_type: str, session_id: str):
         logger.error(f"[analytics] Failed to log event: {e}")
 
 
-# Initialise the database when the app starts
+def log_booking(session_id: str, name: str, business: str, start_time: datetime):
+    """Save a booking record to the bookings table."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO bookings (session_id, client_id, name, business, start_time, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'confirmed', ?)""",
+                (session_id, CLIENT_ID, name, business or "",
+                 start_time.isoformat(), datetime.now(central).isoformat())
+            )
+            conn.commit()
+        logger.info(f"[booking] saved | name={name} | time={start_time}")
+    except Exception as e:
+        logger.error(f"[booking] Failed to save: {e}")
+
+
+def log_lead(session_id: str, name: str, business: str):
+    """Upsert a lead record — one row per session."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            existing = conn.execute(
+                "SELECT id FROM leads WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE leads SET name=?, business=? WHERE session_id=?",
+                    (name, business or "", session_id)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
+                       VALUES (?, ?, ?, ?, 'Chat Widget', 'new', ?)""",
+                    (session_id, CLIENT_ID, name, business or "",
+                     datetime.now(central).isoformat())
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[lead] Failed to save: {e}")
+
+
 init_db()
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 class LumeraChatMessage(BaseModel):
@@ -98,7 +154,6 @@ def get_session(session_id: str | None):
         session_id = str(uuid.uuid4())
     if session_id not in sessions:
         sessions[session_id] = {"booking": reset_booking(), "history": []}
-        # New session = widget was opened — count as a view
         log_event("widget_view", session_id)
     return session_id, sessions[session_id]
 
@@ -296,7 +351,6 @@ async def get_availability():
     try:
         cal_service = get_calendar_service()
         now = datetime.now(central)
-
         time_min = now.isoformat()
         time_max = (now + timedelta(days=14)).isoformat()
 
@@ -343,20 +397,11 @@ async def get_availability():
         raise HTTPException(status_code=500, detail="Could not fetch availability.")
 
 
-# ── Analytics endpoint ─────────────────────────────────────────────────────────
 @app.get("/analytics")
 def get_analytics(client_id: str | None = None):
-    """
-    Returns booking analytics.
-    - Call /analytics            → returns data for this deployment's CLIENT_ID
-    - Call /analytics?client_id=all  → returns combined data across all clients
-      (useful if you ever run a single shared DB)
-    """
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
-
-            # Filter by client unless "all" is requested
             if client_id == "all":
                 rows = conn.execute("SELECT * FROM events ORDER BY timestamp").fetchall()
             else:
@@ -373,7 +418,7 @@ def get_analytics(client_id: str | None = None):
         total_cancellations = 0
 
         for row in rows:
-            month = row["timestamp"][:7]  # "2026-03"
+            month = row["timestamp"][:7]
             et = row["event_type"]
             if et == "widget_view":
                 monthly[month]["views"] += 1
@@ -386,8 +431,6 @@ def get_analytics(client_id: str | None = None):
                 total_cancellations += 1
 
         conv_rate = round((total_bookings / total_views * 100), 1) if total_views else 0
-
-        # Sort months chronologically
         sorted_monthly = dict(sorted(monthly.items()))
 
         return {
@@ -402,7 +445,64 @@ def get_analytics(client_id: str | None = None):
     except Exception as e:
         logger.error(f"Analytics error: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch analytics.")
-# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ── NEW: Bookings endpoint ─────────────────────────────────────────────────────
+@app.get("/bookings")
+def get_bookings(client_id: str | None = None, limit: int = 50):
+    """Return recent bookings for the admin dashboard."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            target = client_id or CLIENT_ID
+            rows = conn.execute(
+                """SELECT * FROM bookings WHERE client_id = ?
+                   ORDER BY start_time ASC LIMIT ?""",
+                (target, limit)
+            ).fetchall()
+        return {"bookings": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Bookings fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch bookings.")
+
+
+# ── NEW: Leads endpoint ────────────────────────────────────────────────────────
+@app.get("/leads")
+def get_leads(client_id: str | None = None, limit: int = 100):
+    """Return leads for the admin dashboard."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            target = client_id or CLIENT_ID
+            rows = conn.execute(
+                """SELECT * FROM leads WHERE client_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (target, limit)
+            ).fetchall()
+        return {"leads": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Leads fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch leads.")
+
+
+# ── NEW: Update lead status ────────────────────────────────────────────────────
+class LeadUpdate(BaseModel):
+    status: str  # new | contacted | qualified | lost
+
+@app.patch("/leads/{lead_id}")
+def update_lead(lead_id: int, body: LeadUpdate):
+    """Let the admin dashboard update a lead's status."""
+    valid = {"new", "contacted", "qualified", "lost"}
+    if body.status not in valid:
+        raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE leads SET status=? WHERE id=?", (body.status, lead_id))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Lead update error: {e}")
+        raise HTTPException(status_code=500, detail="Could not update lead.")
 
 
 @app.post("/chat")
@@ -436,7 +536,17 @@ async def chat(body: LumeraChatMessage):
                     cal_service = get_calendar_service()
                     cancelled = cancel_strategy_call_event(cal_service, name)
                     if cancelled:
-                        log_event("booking_cancelled", session_id)  # ← analytics
+                        log_event("booking_cancelled", session_id)
+                        # Mark booking as cancelled in DB
+                        try:
+                            with sqlite3.connect(DB_PATH) as conn:
+                                conn.execute(
+                                    "UPDATE bookings SET status='cancelled' WHERE name LIKE ? AND client_id=?",
+                                    (f"%{name}%", CLIENT_ID)
+                                )
+                                conn.commit()
+                        except Exception:
+                            pass
                         reply = (
                             f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
                         )
@@ -461,6 +571,10 @@ async def chat(body: LumeraChatMessage):
         if not booking["business"] and extracted.get("business"):
             booking["business"] = extracted["business"]
             logger.info(f"Extracted business: {booking['business']}")
+
+        # Save as lead as soon as we have a name
+        if booking["name"]:
+            log_lead(session_id, booking["name"], booking.get("business", ""))
 
         if not booking["time_suggestion"] and extracted.get("time_text"):
             dt = extract_time(extracted["time_text"])
@@ -489,7 +603,20 @@ async def chat(body: LumeraChatMessage):
             try:
                 cal_service = get_calendar_service()
                 create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
-                log_event("booking_created", session_id)  # ← analytics
+                log_event("booking_created", session_id)
+                # Save to bookings table
+                log_booking(session_id, booking["name"], booking["business"], booking["time"])
+                # Update lead status to qualified
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute(
+                            "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
+                            (session_id, CLIENT_ID)
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
+
                 time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                 reply = (
                     f"You're all set, {booking['name']}! 🎉 "
