@@ -516,7 +516,33 @@ def update_lead(lead_id: int, body: LeadUpdate):
         raise HTTPException(status_code=500, detail="Could not update lead.")
 
 
-@app.post("/chat")
+@app.delete("/leads/{lead_id}")
+def delete_lead(lead_id: int):
+    """Delete a single lead."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM leads WHERE id=? AND client_id=?", (lead_id, CLIENT_ID))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Lead delete error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete lead.")
+
+
+@app.delete("/leads")
+def delete_leads_bulk(ids: list[int]):
+    """Delete multiple leads by ID."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "DELETE FROM leads WHERE id=? AND client_id=?",
+                [(i, CLIENT_ID) for i in ids]
+            )
+            conn.commit()
+        return {"ok": True, "deleted": len(ids)}
+    except Exception as e:
+        logger.error(f"Bulk lead delete error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete leads.")
 async def chat(body: LumeraChatMessage):
     if len(body.message) > MAX_MESSAGE_LENGTH:
         raise HTTPException(status_code=400, detail="Message too long.")
@@ -713,3 +739,38 @@ def create_leads_bulk(body: BulkLeadCreate):
     except Exception as e:
         logger.error(f"Bulk lead create error: {e}")
         raise HTTPException(status_code=500, detail="Could not import leads.")
+
+
+@app.delete("/leads/{lead_id}")
+def delete_lead(lead_id: int):
+    """Delete a single lead."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM leads WHERE id=? AND client_id=?", (lead_id, CLIENT_ID))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Lead delete error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete lead.")
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int]
+
+@app.post("/leads/delete-bulk")
+def delete_leads_bulk(body: BulkDeleteRequest):
+    """Delete multiple leads by ID."""
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="No IDs provided.")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            placeholders = ','.join('?' * len(body.ids))
+            conn.execute(
+                f"DELETE FROM leads WHERE id IN ({placeholders}) AND client_id=?",
+                (*body.ids, CLIENT_ID)
+            )
+            conn.commit()
+        return {"ok": True, "deleted": len(body.ids)}
+    except Exception as e:
+        logger.error(f"Bulk lead delete error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete leads.")
