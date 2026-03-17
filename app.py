@@ -766,7 +766,7 @@ def init_users():
         """)
         conn.commit()
         # Seed default admin from env or fallback
-        default_email = os.getenv("ADMIN_EMAIL", "admin@lumeraautomation.com")
+        default_email = os.getenv("ADMIN_EMAIL", "kory@lumeraautomation.com")
         default_pass  = os.getenv("ADMIN_PASSWORD", "lumera2026")
         existing = conn.execute(
             "SELECT id FROM admin_users WHERE email=?", (default_email,)
