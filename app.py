@@ -636,3 +636,32 @@ async def chat(body: LumeraChatMessage):
     history.append({"role": "assistant", "content": reply})
 
     return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
+
+
+# ── NEW: Manually add a lead ───────────────────────────────────────────────────
+class LeadCreate(BaseModel):
+    name: str
+    business: str | None = None
+    source: str | None = "Manual Entry"
+    status: str | None = "new"
+
+@app.post("/leads")
+def create_lead(body: LeadCreate):
+    """Manually add a lead from the admin dashboard."""
+    valid = {"new", "contacted", "qualified", "lost"}
+    if body.status not in valid:
+        raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), CLIENT_ID, body.name, body.business or "",
+                 body.source or "Manual Entry", body.status,
+                 datetime.now(central).isoformat())
+            )
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Lead create error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create lead.")
