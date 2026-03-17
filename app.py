@@ -895,17 +895,24 @@ def init_users():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin_users (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                email      TEXT NOT NULL UNIQUE,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                email         TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
-                name       TEXT,
-                role       TEXT NOT NULL DEFAULT 'staff',
-                active     INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                name          TEXT,
+                role          TEXT NOT NULL DEFAULT 'staff',
+                client_id     TEXT NOT NULL DEFAULT 'lumera_demo',
+                active        INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL
             )
         """)
         conn.commit()
-        # Seed default admin from env or fallback
+        # Migrate: add client_id if upgrading older DB
+        try:
+            conn.execute("ALTER TABLE admin_users ADD COLUMN client_id TEXT NOT NULL DEFAULT 'lumera_demo'")
+            conn.commit()
+        except Exception:
+            pass
+        # Seed default super-admin
         default_email = os.getenv("ADMIN_EMAIL", "kory@lumeraautomation.com")
         default_pass  = os.getenv("ADMIN_PASSWORD", "lumera2026")
         existing = conn.execute(
@@ -913,13 +920,20 @@ def init_users():
         ).fetchone()
         if not existing:
             conn.execute(
-                """INSERT INTO admin_users (email, password_hash, name, role, active, created_at)
-                   VALUES (?, ?, ?, 'admin', 1, ?)""",
-                (default_email, _hash(default_pass), "Admin",
+                """INSERT INTO admin_users (email, password_hash, name, role, client_id, active, created_at)
+                   VALUES (?, ?, ?, 'superadmin', 'lumera_demo', 1, ?)""",
+                (default_email, _hash(default_pass), "Kory",
                  datetime.now(central).isoformat())
             )
             conn.commit()
-            logger.info(f"[users] Seeded default admin: {default_email}")
+            logger.info(f"[users] Seeded superadmin: {default_email}")
+        else:
+            # Upgrade existing Kory account to superadmin
+            conn.execute(
+                "UPDATE admin_users SET role='superadmin', name='Kory' WHERE email=?",
+                (default_email,)
+            )
+            conn.commit()
 
 def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -946,10 +960,11 @@ def login(body: LoginRequest):
         return {
             "ok": True,
             "user": {
-                "id":    user["id"],
-                "email": user["email"],
-                "name":  user["name"],
-                "role":  user["role"],
+                "id":        user["id"],
+                "email":     user["email"],
+                "name":      user["name"],
+                "role":      user["role"],
+                "client_id": user["client_id"] if "client_id" in user.keys() else "lumera_demo",
             }
         }
     except HTTPException:
@@ -964,6 +979,7 @@ class UserCreate(BaseModel):
     password: str
     name: str | None = None
     role: str | None = "staff"
+    client_id: str | None = "lumera_demo"
 
 @app.get("/auth/users")
 def get_users():
@@ -972,7 +988,7 @@ def get_users():
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, email, name, role, active, created_at FROM admin_users ORDER BY created_at"
+                "SELECT id, email, name, role, client_id, active, created_at FROM admin_users ORDER BY created_at"
             ).fetchall()
         return {"users": [dict(r) for r in rows]}
     except Exception as e:
@@ -982,16 +998,17 @@ def get_users():
 @app.post("/auth/users")
 def create_user(body: UserCreate):
     """Add a new admin user."""
-    valid_roles = {"admin", "staff"}
+    valid_roles = {"admin", "staff", "client"}
     if body.role not in valid_roles:
-        raise HTTPException(status_code=400, detail="role must be admin or staff")
+        raise HTTPException(status_code=400, detail="role must be admin, staff, or client")
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                """INSERT INTO admin_users (email, password_hash, name, role, active, created_at)
-                   VALUES (?, ?, ?, ?, 1, ?)""",
+                """INSERT INTO admin_users (email, password_hash, name, role, client_id, active, created_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?)""",
                 (body.email.strip().lower(), _hash(body.password),
                  body.name or body.email.split("@")[0], body.role,
+                 body.client_id or "lumera_demo",
                  datetime.now(central).isoformat())
             )
             conn.commit()
@@ -1006,11 +1023,12 @@ class UserUpdate(BaseModel):
     name: str | None = None
     password: str | None = None
     role: str | None = None
+    client_id: str | None = None
     active: int | None = None
 
 @app.patch("/auth/users/{user_id}")
 def update_user(user_id: int, body: UserUpdate):
-    """Update name, password, role, or active status."""
+    """Update name, password, role, client_id, or active status."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             if body.name is not None:
@@ -1019,6 +1037,8 @@ def update_user(user_id: int, body: UserUpdate):
                 conn.execute("UPDATE admin_users SET password_hash=? WHERE id=?", (_hash(body.password), user_id))
             if body.role is not None:
                 conn.execute("UPDATE admin_users SET role=? WHERE id=?", (body.role, user_id))
+            if body.client_id is not None:
+                conn.execute("UPDATE admin_users SET client_id=? WHERE id=?", (body.client_id, user_id))
             if body.active is not None:
                 conn.execute("UPDATE admin_users SET active=? WHERE id=?", (body.active, user_id))
             conn.commit()
