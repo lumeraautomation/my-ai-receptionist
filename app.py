@@ -665,3 +665,37 @@ def create_lead(body: LeadCreate):
     except Exception as e:
         logger.error(f"Lead create error: {e}")
         raise HTTPException(status_code=500, detail="Could not create lead.")
+
+
+class BulkLeadCreate(BaseModel):
+    leads: list[LeadCreate]
+
+@app.post("/leads/bulk")
+def create_leads_bulk(body: BulkLeadCreate):
+    """Import multiple leads at once (CSV import from admin dashboard)."""
+    if len(body.leads) > 5000:
+        raise HTTPException(status_code=400, detail="Max 5000 leads per import.")
+    inserted = 0
+    skipped = 0
+    now = datetime.now(central).isoformat()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for lead in body.leads:
+                if not lead.name or not lead.name.strip():
+                    skipped += 1
+                    continue
+                valid = {"new", "contacted", "qualified", "lost"}
+                status = lead.status if lead.status in valid else "new"
+                conn.execute(
+                    """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), CLIENT_ID, lead.name.strip(),
+                     lead.business or "", lead.source or "CSV Import",
+                     status, now)
+                )
+                inserted += 1
+            conn.commit()
+        return {"ok": True, "inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        logger.error(f"Bulk lead create error: {e}")
+        raise HTTPException(status_code=500, detail="Could not import leads.")
