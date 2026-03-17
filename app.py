@@ -527,22 +527,6 @@ def delete_lead(lead_id: int):
     except Exception as e:
         logger.error(f"Lead delete error: {e}")
         raise HTTPException(status_code=500, detail="Could not delete lead.")
-
-
-@app.delete("/leads")
-def delete_leads_bulk(ids: list[int]):
-    """Delete multiple leads by ID."""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.executemany(
-                "DELETE FROM leads WHERE id=? AND client_id=?",
-                [(i, CLIENT_ID) for i in ids]
-            )
-            conn.commit()
-        return {"ok": True, "deleted": len(ids)}
-    except Exception as e:
-        logger.error(f"Bulk lead delete error: {e}")
-        raise HTTPException(status_code=500, detail="Could not delete leads.")
 async def chat(body: LumeraChatMessage):
     if len(body.message) > MAX_MESSAGE_LENGTH:
         raise HTTPException(status_code=400, detail="Message too long.")
@@ -741,19 +725,6 @@ def create_leads_bulk(body: BulkLeadCreate):
         raise HTTPException(status_code=500, detail="Could not import leads.")
 
 
-@app.delete("/leads/{lead_id}")
-def delete_lead(lead_id: int):
-    """Delete a single lead."""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM leads WHERE id=? AND client_id=?", (lead_id, CLIENT_ID))
-            conn.commit()
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Lead delete error: {e}")
-        raise HTTPException(status_code=500, detail="Could not delete lead.")
-
-
 class BulkDeleteRequest(BaseModel):
     ids: list[int]
 
@@ -774,3 +745,130 @@ def delete_leads_bulk(body: BulkDeleteRequest):
     except Exception as e:
         logger.error(f"Bulk lead delete error: {e}")
         raise HTTPException(status_code=500, detail="Could not delete leads.")
+
+
+@app.post("/chat")
+async def chat(body: LumeraChatMessage):
+    if len(body.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(status_code=400, detail="Message too long.")
+
+    session_id, session = get_session(body.session_id)
+    booking = session["booking"]
+    history = session["history"]
+    user_message = body.message.strip()
+
+    logger.info(f"[{session_id}] User: {user_message}")
+    history.append({"role": "user", "content": user_message})
+    if len(history) > MAX_HISTORY_LENGTH:
+        history = history[-MAX_HISTORY_LENGTH:]
+        session["history"] = history
+
+    reply = None
+
+    # --- Cancellation flow ---
+    cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
+    if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
+        booking["cancelling"] = True
+        if not booking.get("cancellation_name"):
+            extracted = extract_booking_info_with_ai(user_message, booking)
+            name = extracted.get("name")
+            if name:
+                booking["cancellation_name"] = name
+                try:
+                    cal_service = get_calendar_service()
+                    cancelled = cancel_strategy_call_event(cal_service, name)
+                    if cancelled:
+                        log_event("booking_cancelled", session_id)
+                        try:
+                            with sqlite3.connect(DB_PATH) as conn:
+                                conn.execute(
+                                    "UPDATE bookings SET status='cancelled' WHERE name LIKE ? AND client_id=?",
+                                    (f"%{name}%", CLIENT_ID)
+                                )
+                                conn.commit()
+                        except Exception:
+                            pass
+                        reply = (
+                            f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                        )
+                    else:
+                        reply = f"I couldn't find a strategy call for {name}. Could you double-check the name?"
+                except Exception as e:
+                    logger.error(f"Cancel error: {e}")
+                    reply = "I had trouble accessing the calendar. Please try again."
+                booking["cancelling"] = False
+                booking["cancellation_name"] = None
+            else:
+                reply = "Sure! What's the full name the strategy call was booked under?"
+
+    # --- Booking flow ---
+    if reply is None:
+        extracted = extract_booking_info_with_ai(user_message, booking)
+
+        if not booking["name"] and extracted.get("name"):
+            booking["name"] = extracted["name"]
+            logger.info(f"Extracted name: {booking['name']}")
+
+        if not booking["business"] and extracted.get("business"):
+            booking["business"] = extracted["business"]
+            logger.info(f"Extracted business: {booking['business']}")
+
+        if booking["name"]:
+            log_lead(session_id, booking["name"], booking.get("business", ""))
+
+        if not booking["time_suggestion"] and extracted.get("time_text"):
+            dt = extract_time(extracted["time_text"])
+            if dt:
+                if valid_business_hours(dt):
+                    booking["time_suggestion"] = dt
+                    logger.info(f"Extracted time: {dt}")
+                else:
+                    next_slot = find_next_available(dt)
+                    if next_slot:
+                        booking["time_suggestion"] = next_slot
+                        reply = (
+                            f"That time is outside our hours (Mon-Fri, 9am-5pm CT). "
+                            f"Next available: {next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
+                            f"Does that work?"
+                        )
+
+        confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great", "confirmed", "yep", "yup"]
+        if booking["time_suggestion"] and not booking["time_confirmed"]:
+            if any(w in user_message.lower() for w in confirm_words):
+                booking["time"] = booking["time_suggestion"]
+                booking["time_confirmed"] = True
+
+        if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
+            try:
+                cal_service = get_calendar_service()
+                create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
+                log_event("booking_created", session_id)
+                log_booking(session_id, booking["name"], booking["business"], booking["time"])
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute(
+                            "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
+                            (session_id, CLIENT_ID)
+                        )
+                        conn.commit()
+                except Exception:
+                    pass
+                time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
+                reply = (
+                    f"You're all set, {booking['name']}! 🎉 "
+                    f"Your free 30-minute strategy call is booked for {time_str} CT. "
+                    f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
+                )
+                session["booking"] = reset_booking()
+            except Exception as e:
+                logger.error(f"Booking error: {e}")
+                reply = "I had trouble saving to the calendar. Please try again in a moment."
+
+    # --- AI fallback ---
+    if reply is None:
+        reply = get_ai_reply(history, booking)
+
+    logger.info(f"[{session_id}] Bot: {reply}")
+    history.append({"role": "assistant", "content": reply})
+
+    return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
