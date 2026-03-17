@@ -998,9 +998,9 @@ def get_users():
 @app.post("/auth/users")
 def create_user(body: UserCreate):
     """Add a new admin user."""
-    valid_roles = {"admin", "staff", "client"}
+    valid_roles = {"admin", "staff", "client", "client_staff"}
     if body.role not in valid_roles:
-        raise HTTPException(status_code=400, detail="role must be admin, staff, or client")
+        raise HTTPException(status_code=400, detail="role must be admin, staff, client, or client_staff")
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
