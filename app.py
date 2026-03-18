@@ -291,7 +291,8 @@ def reset_booking():
         "time_suggestion": None,
         "time_confirmed": False,
         "cancelling": False,
-        "cancellation_name": None
+        "cancellation_name": None,
+        "cancelling_events": []   # holds multiple matches pending user selection
     }
 
 
@@ -446,17 +447,29 @@ def create_strategy_call_event(service, name, business, booking_time):
     return created.get("htmlLink")
 
 
-def cancel_strategy_call_event(service, name):
+def find_cancellable_events(service, name):
+    """Return all upcoming events whose summary contains the given name."""
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
         calendarId=CALENDAR_ID, timeMin=now,
         maxResults=20, singleEvents=True, orderBy="startTime"
     ).execute()
+    matches = []
     for event in events_result.get("items", []):
         if name.lower() in event.get("summary", "").lower():
-            service.events().delete(calendarId=CALENDAR_ID, eventId=event["id"]).execute()
-            return True
-    return False
+            start = event["start"].get("dateTime", "")
+            try:
+                start_dt = datetime.fromisoformat(start).astimezone(central)
+                display = start_dt.strftime("%A, %B %d at %I:%M %p") + " CT"
+            except Exception:
+                display = start
+            matches.append({"id": event["id"], "display": display})
+    return matches
+
+
+def delete_event_by_id(service, event_id):
+    """Delete a single calendar event by ID."""
+    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
 
 
 def get_ai_reply(history, booking):
@@ -973,15 +986,95 @@ async def chat(body: LumeraChatMessage):
     cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
     if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
         booking["cancelling"] = True
-        if not booking.get("cancellation_name"):
+
+        # Step 3: user has multiple events pending — they're replying with a choice
+        if booking.get("cancelling_events"):
+            events = booking["cancelling_events"]
+            chosen = None
+            for i, event in enumerate(events, start=1):
+                if str(i) in user_message or event["display"].lower() in user_message.lower():
+                    chosen = event
+                    break
+            if chosen:
+                try:
+                    cal_service = get_calendar_service()
+                    delete_event_by_id(cal_service, chosen["id"])
+                    log_event("booking_cancelled", session_id)
+                    try:
+                        with sqlite3.connect(DB_PATH) as conn:
+                            conn.execute(
+                                "UPDATE bookings SET status='cancelled' WHERE name LIKE ? AND client_id=?",
+                                (f"%{booking['cancellation_name']}%", CLIENT_ID)
+                            )
+                            conn.commit()
+                    except Exception:
+                        pass
+                    reply = (
+                        f"Done! I've cancelled the {chosen['display']} call for "
+                        f"{booking['cancellation_name']}. Feel free to rebook anytime!"
+                    )
+                except Exception as e:
+                    logger.error(f"Cancel error: {e}")
+                    reply = "I had trouble cancelling that event. Please try again."
+                booking["cancelling"] = False
+                booking["cancellation_name"] = None
+                booking["cancelling_events"] = []
+            else:
+                options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(events, start=1))
+                reply = f"Which one would you like to cancel? Just reply with the number:\n{options}"
+
+        # Step 2: we have the name — look up their events on the calendar
+        elif booking.get("cancellation_name"):
+            name = booking["cancellation_name"]
+            try:
+                cal_service = get_calendar_service()
+                matches = find_cancellable_events(cal_service, name)
+                if len(matches) == 0:
+                    reply = f"I couldn't find any upcoming strategy calls for {name}. Could you double-check the name?"
+                    booking["cancelling"] = False
+                    booking["cancellation_name"] = None
+                elif len(matches) == 1:
+                    delete_event_by_id(cal_service, matches[0]["id"])
+                    log_event("booking_cancelled", session_id)
+                    try:
+                        with sqlite3.connect(DB_PATH) as conn:
+                            conn.execute(
+                                "UPDATE bookings SET status='cancelled' WHERE name LIKE ? AND client_id=?",
+                                (f"%{name}%", CLIENT_ID)
+                            )
+                            conn.commit()
+                    except Exception:
+                        pass
+                    reply = f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                    booking["cancelling"] = False
+                    booking["cancellation_name"] = None
+                    booking["cancelling_events"] = []
+                else:
+                    booking["cancelling_events"] = matches
+                    options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
+                    reply = (
+                        f"I found {len(matches)} upcoming calls for {name}. "
+                        f"Which one would you like to cancel?\n{options}"
+                    )
+            except Exception as e:
+                logger.error(f"Cancel lookup error: {e}")
+                reply = "I had trouble accessing the calendar. Please try again."
+
+        # Step 1: we don't have a name yet — extract it or ask
+        else:
             extracted = extract_booking_info_with_ai(user_message, booking)
             name = extracted.get("name")
             if name:
                 booking["cancellation_name"] = name
                 try:
                     cal_service = get_calendar_service()
-                    cancelled = cancel_strategy_call_event(cal_service, name)
-                    if cancelled:
+                    matches = find_cancellable_events(cal_service, name)
+                    if len(matches) == 0:
+                        reply = f"I couldn't find any upcoming strategy calls for {name}. Could you double-check the name?"
+                        booking["cancelling"] = False
+                        booking["cancellation_name"] = None
+                    elif len(matches) == 1:
+                        delete_event_by_id(cal_service, matches[0]["id"])
                         log_event("booking_cancelled", session_id)
                         try:
                             with sqlite3.connect(DB_PATH) as conn:
@@ -992,16 +1085,20 @@ async def chat(body: LumeraChatMessage):
                                 conn.commit()
                         except Exception:
                             pass
-                        reply = (
-                            f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
-                        )
+                        reply = f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                        booking["cancelling"] = False
+                        booking["cancellation_name"] = None
+                        booking["cancelling_events"] = []
                     else:
-                        reply = f"I couldn't find a strategy call for {name}. Could you double-check the name?"
+                        booking["cancelling_events"] = matches
+                        options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
+                        reply = (
+                            f"I found {len(matches)} upcoming calls for {name}. "
+                            f"Which one would you like to cancel?\n{options}"
+                        )
                 except Exception as e:
                     logger.error(f"Cancel error: {e}")
                     reply = "I had trouble accessing the calendar. Please try again."
-                booking["cancelling"] = False
-                booking["cancellation_name"] = None
             else:
                 reply = "Sure! What's the full name the strategy call was booked under?"
 
