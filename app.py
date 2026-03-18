@@ -47,7 +47,6 @@ def init_db():
                 timestamp  TEXT NOT NULL
             )
         """)
-        # NEW: bookings table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +59,6 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        # NEW: leads table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS leads (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +73,6 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        # Add email/phone columns if upgrading from older DB
         try:
             conn.execute("ALTER TABLE leads ADD COLUMN email TEXT")
         except Exception:
@@ -101,7 +98,6 @@ def log_event(event_type: str, session_id: str):
 
 
 def log_booking(session_id: str, name: str, business: str, start_time: datetime):
-    """Save a booking record to the bookings table."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
@@ -117,7 +113,6 @@ def log_booking(session_id: str, name: str, business: str, start_time: datetime)
 
 
 def log_lead(session_id: str, name: str, business: str):
-    """Upsert a lead record — one row per session."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             existing = conn.execute(
@@ -143,7 +138,7 @@ def log_lead(session_id: str, name: str, business: str):
 init_db()
 
 
-# ── Clients table (active paying clients) ─────────────────────────────────────
+# ── Clients table ─────────────────────────────────────────────────────────────
 def init_clients():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -354,6 +349,7 @@ def valid_business_hours(dt):
 
 
 def find_next_available(start_dt):
+    """Walk forward until a slot within business hours is found (no calendar check)."""
     dt = start_dt
     for _ in range(200):
         if valid_business_hours(dt):
@@ -364,6 +360,41 @@ def find_next_available(start_dt):
             while dt.weekday() >= 5:
                 dt += timedelta(days=1)
     return None
+
+
+# ── FIX: calendar-aware availability helpers ──────────────────────────────────
+
+def is_slot_available(service, start_dt: datetime) -> bool:
+    """Return True if the 1-hour slot starting at start_dt has no calendar conflicts."""
+    end_dt = start_dt + timedelta(hours=1)
+    body = {
+        "timeMin": start_dt.isoformat(),
+        "timeMax": end_dt.isoformat(),
+        "items": [{"id": CALENDAR_ID}],
+    }
+    result = service.freebusy().query(body=body).execute()
+    busy = result.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
+    return len(busy) == 0
+
+
+def find_next_available_open(service, start_dt: datetime) -> datetime | None:
+    """Walk forward hour-by-hour until we find a slot that is both in business
+    hours AND has no calendar conflicts."""
+    dt = start_dt + timedelta(hours=1)
+    for _ in range(200):
+        if not valid_business_hours(dt):
+            dt += timedelta(hours=1)
+            if dt.hour >= 17:
+                dt = dt.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                while dt.weekday() >= 5:
+                    dt += timedelta(days=1)
+            continue
+        if is_slot_available(service, dt):
+            return dt
+        dt += timedelta(hours=1)
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def extract_booking_info_with_ai(message, booking):
@@ -598,10 +629,8 @@ def get_analytics(client_id: str | None = None):
         raise HTTPException(status_code=500, detail="Could not fetch analytics.")
 
 
-# ── NEW: Bookings endpoint ─────────────────────────────────────────────────────
 @app.get("/bookings")
 def get_bookings(client_id: str | None = None, limit: int = 50):
-    """Return recent bookings for the admin dashboard."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -617,10 +646,8 @@ def get_bookings(client_id: str | None = None, limit: int = 50):
         raise HTTPException(status_code=500, detail="Could not fetch bookings.")
 
 
-# ── NEW: Leads endpoint ────────────────────────────────────────────────────────
 @app.get("/leads")
 def get_leads(client_id: str | None = None, limit: int = 100):
-    """Return leads for the admin dashboard."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -636,13 +663,11 @@ def get_leads(client_id: str | None = None, limit: int = 100):
         raise HTTPException(status_code=500, detail="Could not fetch leads.")
 
 
-# ── NEW: Update lead status ────────────────────────────────────────────────────
 class LeadUpdate(BaseModel):
     status: str  # new | contacted | qualified | lost
 
 @app.patch("/leads/{lead_id}")
 def update_lead(lead_id: int, body: LeadUpdate):
-    """Let the admin dashboard update a lead's status."""
     valid = {"new", "contacted", "qualified", "lost"}
     if body.status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
@@ -658,7 +683,6 @@ def update_lead(lead_id: int, body: LeadUpdate):
 
 @app.delete("/leads/{lead_id}")
 def delete_lead(lead_id: int):
-    """Delete a single lead."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM leads WHERE id=? AND client_id=?", (lead_id, CLIENT_ID))
@@ -667,139 +691,8 @@ def delete_lead(lead_id: int):
     except Exception as e:
         logger.error(f"Lead delete error: {e}")
         raise HTTPException(status_code=500, detail="Could not delete lead.")
-async def chat(body: LumeraChatMessage):
-    if len(body.message) > MAX_MESSAGE_LENGTH:
-        raise HTTPException(status_code=400, detail="Message too long.")
-
-    session_id, session = get_session(body.session_id)
-    booking = session["booking"]
-    history = session["history"]
-    user_message = body.message.strip()
-
-    logger.info(f"[{session_id}] User: {user_message}")
-    history.append({"role": "user", "content": user_message})
-    if len(history) > MAX_HISTORY_LENGTH:
-        history = history[-MAX_HISTORY_LENGTH:]
-        session["history"] = history
-
-    reply = None
-
-    # --- Cancellation flow ---
-    cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
-    if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
-        booking["cancelling"] = True
-        if not booking.get("cancellation_name"):
-            extracted = extract_booking_info_with_ai(user_message, booking)
-            name = extracted.get("name")
-            if name:
-                booking["cancellation_name"] = name
-                try:
-                    cal_service = get_calendar_service()
-                    cancelled = cancel_strategy_call_event(cal_service, name)
-                    if cancelled:
-                        log_event("booking_cancelled", session_id)
-                        # Mark booking as cancelled in DB
-                        try:
-                            with sqlite3.connect(DB_PATH) as conn:
-                                conn.execute(
-                                    "UPDATE bookings SET status='cancelled' WHERE name LIKE ? AND client_id=?",
-                                    (f"%{name}%", CLIENT_ID)
-                                )
-                                conn.commit()
-                        except Exception:
-                            pass
-                        reply = (
-                            f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
-                        )
-                    else:
-                        reply = f"I couldn't find a strategy call for {name}. Could you double-check the name?"
-                except Exception as e:
-                    logger.error(f"Cancel error: {e}")
-                    reply = "I had trouble accessing the calendar. Please try again."
-                booking["cancelling"] = False
-                booking["cancellation_name"] = None
-            else:
-                reply = "Sure! What's the full name the strategy call was booked under?"
-
-    # --- Booking flow ---
-    if reply is None:
-        extracted = extract_booking_info_with_ai(user_message, booking)
-
-        if not booking["name"] and extracted.get("name"):
-            booking["name"] = extracted["name"]
-            logger.info(f"Extracted name: {booking['name']}")
-
-        if not booking["business"] and extracted.get("business"):
-            booking["business"] = extracted["business"]
-            logger.info(f"Extracted business: {booking['business']}")
-
-        # Save as lead as soon as we have a name
-        if booking["name"]:
-            log_lead(session_id, booking["name"], booking.get("business", ""))
-
-        if not booking["time_suggestion"] and extracted.get("time_text"):
-            dt = extract_time(extracted["time_text"])
-            if dt:
-                if valid_business_hours(dt):
-                    booking["time_suggestion"] = dt
-                    logger.info(f"Extracted time: {dt}")
-                else:
-                    next_slot = find_next_available(dt)
-                    if next_slot:
-                        booking["time_suggestion"] = next_slot
-                        reply = (
-                            f"That time is outside our hours (Mon-Fri, 9am-5pm CT). "
-                            f"Next available: {next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
-                            f"Does that work?"
-                        )
-
-        confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great", "confirmed", "yep", "yup"]
-        if booking["time_suggestion"] and not booking["time_confirmed"]:
-            if any(w in user_message.lower() for w in confirm_words):
-                booking["time"] = booking["time_suggestion"]
-                booking["time_confirmed"] = True
-
-        # All info collected — create booking
-        if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
-            try:
-                cal_service = get_calendar_service()
-                create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
-                log_event("booking_created", session_id)
-                # Save to bookings table
-                log_booking(session_id, booking["name"], booking["business"], booking["time"])
-                # Update lead status to qualified
-                try:
-                    with sqlite3.connect(DB_PATH) as conn:
-                        conn.execute(
-                            "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
-                            (session_id, CLIENT_ID)
-                        )
-                        conn.commit()
-                except Exception:
-                    pass
-
-                time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
-                reply = (
-                    f"You're all set, {booking['name']}! 🎉 "
-                    f"Your free 30-minute strategy call is booked for {time_str} CT. "
-                    f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
-                )
-                session["booking"] = reset_booking()
-            except Exception as e:
-                logger.error(f"Booking error: {e}")
-                reply = "I had trouble saving to the calendar. Please try again in a moment."
-
-    # --- AI fallback ---
-    if reply is None:
-        reply = get_ai_reply(history, booking)
-
-    logger.info(f"[{session_id}] Bot: {reply}")
-    history.append({"role": "assistant", "content": reply})
-
-    return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
 
 
-# ── NEW: Manually add a lead ───────────────────────────────────────────────────
 class LeadCreate(BaseModel):
     name: str
     business: str | None = None
@@ -810,7 +703,6 @@ class LeadCreate(BaseModel):
 
 @app.post("/leads")
 def create_lead(body: LeadCreate):
-    """Manually add a lead from the admin dashboard."""
     valid = {"new", "contacted", "qualified", "lost"}
     if body.status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
@@ -836,7 +728,6 @@ class BulkLeadCreate(BaseModel):
 
 @app.post("/leads/bulk")
 def create_leads_bulk(body: BulkLeadCreate):
-    """Import multiple leads at once (CSV import from admin dashboard)."""
     if len(body.leads) > 5000:
         raise HTTPException(status_code=400, detail="Max 5000 leads per import.")
     inserted = 0
@@ -870,7 +761,6 @@ class BulkDeleteRequest(BaseModel):
 
 @app.post("/leads/delete-bulk")
 def delete_leads_bulk(body: BulkDeleteRequest):
-    """Delete multiple leads by ID."""
     if not body.ids:
         raise HTTPException(status_code=400, detail="No IDs provided.")
     try:
@@ -890,7 +780,6 @@ def delete_leads_bulk(body: BulkDeleteRequest):
 import hashlib
 import secrets
 
-# ── Users table ───────────────────────────────────────────────────────────────
 def init_users():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -907,7 +796,6 @@ def init_users():
             )
         """)
         conn.commit()
-        # Migrate: add columns if upgrading older DB
         try:
             conn.execute("ALTER TABLE admin_users ADD COLUMN client_id TEXT NOT NULL DEFAULT 'lumera_demo'")
             conn.commit()
@@ -918,7 +806,6 @@ def init_users():
             conn.commit()
         except Exception:
             pass
-        # Seed default super-admin
         default_email = os.getenv("ADMIN_EMAIL", "kory@lumeraautomation.com")
         default_pass  = os.getenv("ADMIN_PASSWORD", "lumera2026")
         existing = conn.execute(
@@ -934,7 +821,6 @@ def init_users():
             conn.commit()
             logger.info(f"[users] Seeded superadmin: {default_email}")
         else:
-            # Upgrade existing Kory account to superadmin
             conn.execute(
                 "UPDATE admin_users SET role='superadmin', name='Kory' WHERE email=?",
                 (default_email,)
@@ -953,7 +839,6 @@ class LoginRequest(BaseModel):
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
-    """Validate admin credentials. Returns user info on success."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -966,7 +851,7 @@ def login(body: LoginRequest):
         return {
             "ok": True,
             "user": {
-                "id":        user["id"],
+                "id":            user["id"],
                 "email":         user["email"],
                 "name":          user["name"],
                 "role":          user["role"],
@@ -991,7 +876,6 @@ class UserCreate(BaseModel):
 
 @app.get("/auth/users")
 def get_users():
-    """List all admin users."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -1005,7 +889,6 @@ def get_users():
 
 @app.post("/auth/users")
 def create_user(body: UserCreate):
-    """Add a new admin user."""
     valid_roles = {"admin", "staff", "client", "client_staff"}
     if body.role not in valid_roles:
         raise HTTPException(status_code=400, detail="role must be admin, staff, client, or client_staff")
@@ -1038,7 +921,6 @@ class UserUpdate(BaseModel):
 
 @app.patch("/auth/users/{user_id}")
 def update_user(user_id: int, body: UserUpdate):
-    """Update name, password, role, client_id, or active status."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             if body.name is not None:
@@ -1059,7 +941,6 @@ def update_user(user_id: int, body: UserUpdate):
 
 @app.delete("/auth/users/{user_id}")
 def delete_user(user_id: int):
-    """Remove an admin user."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM admin_users WHERE id=?", (user_id,))
@@ -1161,28 +1042,53 @@ async def chat(body: LumeraChatMessage):
                 booking["time"] = booking["time_suggestion"]
                 booking["time_confirmed"] = True
 
+        # All info collected — check availability then create booking
         if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
             try:
                 cal_service = get_calendar_service()
-                create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
-                log_event("booking_created", session_id)
-                log_booking(session_id, booking["name"], booking["business"], booking["time"])
-                try:
-                    with sqlite3.connect(DB_PATH) as conn:
-                        conn.execute(
-                            "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
-                            (session_id, CLIENT_ID)
+
+                # ── FIX: verify the slot is actually free before booking ────────
+                if not is_slot_available(cal_service, booking["time"]):
+                    next_slot = find_next_available_open(cal_service, booking["time"])
+                    if next_slot:
+                        booking["time"] = next_slot
+                        booking["time_suggestion"] = next_slot
+                        booking["time_confirmed"] = False  # require re-confirmation
+                        reply = (
+                            f"Sorry, that slot just filled up! The next available time is "
+                            f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
+                            f"Does that work for you?"
                         )
-                        conn.commit()
-                except Exception:
-                    pass
-                time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
-                reply = (
-                    f"You're all set, {booking['name']}! 🎉 "
-                    f"Your free 30-minute strategy call is booked for {time_str} CT. "
-                    f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
-                )
-                session["booking"] = reset_booking()
+                    else:
+                        booking["time"] = None
+                        booking["time_suggestion"] = None
+                        booking["time_confirmed"] = False
+                        reply = (
+                            "That slot isn't available and I couldn't find an opening nearby. "
+                            "Could you suggest a different day or time?"
+                        )
+                # ─────────────────────────────────────────────────────────────
+                else:
+                    create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
+                    log_event("booking_created", session_id)
+                    log_booking(session_id, booking["name"], booking["business"], booking["time"])
+                    try:
+                        with sqlite3.connect(DB_PATH) as conn:
+                            conn.execute(
+                                "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
+                                (session_id, CLIENT_ID)
+                            )
+                            conn.commit()
+                    except Exception:
+                        pass
+                    time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
+                    reply = (
+                        f"You're all set, {booking['name']}! 🎉 "
+                        f"Your free 30-minute strategy call is booked for {time_str} CT. "
+                        f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
+                    )
+                    session["booking"] = reset_booking()
+
             except Exception as e:
                 logger.error(f"Booking error: {e}")
                 reply = "I had trouble saving to the calendar. Please try again in a moment."
