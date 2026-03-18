@@ -13,6 +13,7 @@ import sqlite3
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import resend
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ def log_booking(session_id: str, name: str, business: str, start_time: datetime)
         logger.error(f"[booking] Failed to save: {e}")
 
 
-def log_lead(session_id: str, name: str, business: str):
+def log_lead(session_id: str, name: str, business: str, email: str = ""):
     try:
         with sqlite3.connect(DB_PATH) as conn:
             existing = conn.execute(
@@ -120,14 +121,14 @@ def log_lead(session_id: str, name: str, business: str):
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE leads SET name=?, business=? WHERE session_id=?",
-                    (name, business or "", session_id)
+                    "UPDATE leads SET name=?, business=?, email=COALESCE(NULLIF(?, ''), email) WHERE session_id=?",
+                    (name, business or "", email or "", session_id)
                 )
             else:
                 conn.execute(
-                    """INSERT INTO leads (session_id, client_id, name, business, source, status, created_at)
-                       VALUES (?, ?, ?, ?, 'Chat Widget', 'new', ?)""",
-                    (session_id, CLIENT_ID, name, business or "",
+                    """INSERT INTO leads (session_id, client_id, name, business, email, source, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, 'Chat Widget', 'new', ?)""",
+                    (session_id, CLIENT_ID, name, business or "", email or "",
                      datetime.now(central).isoformat())
                 )
             conn.commit()
@@ -136,6 +137,70 @@ def log_lead(session_id: str, name: str, business: str):
 
 
 init_db()
+
+
+# ── Email helpers ─────────────────────────────────────────────────────────────
+
+def send_booking_confirmation(name: str, email: str, booking_time: datetime):
+    """Send immediate confirmation email after a booking is created."""
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key or not email:
+        return
+    resend.api_key = api_key
+    time_str = booking_time.strftime("%A, %B %d at %I:%M %p")
+    try:
+        resend.Emails.send({
+            "from": os.getenv("FROM_EMAIL", "noreply@lumeraautomation.com"),
+            "to": email,
+            "subject": "Your Lumera Strategy Call is Confirmed!",
+            "html": f"""
+                <div style="font-family:sans-serif;max-width:560px;margin:0 auto;color:#222;">
+                  <h2 style="color:#111;">You're booked, {name}! 🎉</h2>
+                  <p>Your free 30-minute strategy call is confirmed for
+                     <strong>{time_str} CT</strong>.</p>
+                  <p>We'll walk through your business and show exactly how Lumera can
+                     work for you.</p>
+                  <p>If you need to reschedule or cancel, just reply to this email.</p>
+                  <br>
+                  <p>Talk soon,<br><strong>Kory @ Lumera Automation</strong></p>
+                </div>
+            """
+        })
+        logger.info(f"[email] Confirmation sent to {email}")
+    except Exception as e:
+        logger.error(f"[email] Confirmation failed: {e}")
+
+
+def send_lead_followup(name: str, email: str):
+    """Send a follow-up email to a lead who chatted but never booked."""
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key or not email:
+        return
+    resend.api_key = api_key
+    try:
+        resend.Emails.send({
+            "from": os.getenv("FROM_EMAIL", "noreply@lumeraautomation.com"),
+            "to": email,
+            "subject": "Still thinking it over?",
+            "html": f"""
+                <div style="font-family:sans-serif;max-width:560px;margin:0 auto;color:#222;">
+                  <h2 style="color:#111;">Hey {name},</h2>
+                  <p>You stopped by our site earlier and I wanted to follow up personally.</p>
+                  <p>If you're still wondering whether Lumera could work for your business —
+                     I'd love to show you. Our strategy calls are free, 30 minutes, and
+                     zero pressure.</p>
+                  <p><a href="https://lumeraautomation.com" style="color:#4f46e5;">
+                     Book a time here →</a></p>
+                  <br>
+                  <p>– Kory @ Lumera Automation</p>
+                </div>
+            """
+        })
+        logger.info(f"[email] Lead follow-up sent to {email}")
+    except Exception as e:
+        logger.error(f"[email] Lead follow-up failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── Clients table ─────────────────────────────────────────────────────────────
@@ -287,6 +352,7 @@ def reset_booking():
     return {
         "name": None,
         "business": None,
+        "email": None,
         "time": None,
         "time_suggestion": None,
         "time_confirmed": False,
@@ -407,17 +473,20 @@ Message: "{message}"
 Current known info:
 - name: {booking['name']}
 - business: {booking['business']}
+- email: {booking.get('email')}
 
 Return JSON with these fields (use null if not found):
 {{
   "name": "First Last or null",
   "business": "business name or null",
+  "email": "email address or null",
   "time_text": "the time/date mentioned verbatim or null"
 }}
 
 Rules:
 - name must be a full name (first + last). Do not return single words or generic words like "strategy", "call", "yes", "book", "cancel".
 - business is optional
+- email must be a valid email address format or null
 - time_text is the raw date/time string from the message if any"""
 
     try:
@@ -432,7 +501,7 @@ Rules:
         return json.loads(raw)
     except Exception as e:
         logger.error(f"AI extraction error: {e}")
-        return {"name": None, "business": None, "time_text": None}
+        return {"name": None, "business": None, "email": None, "time_text": None}
 
 
 def create_strategy_call_event(service, name, business, booking_time):
@@ -513,6 +582,7 @@ When someone wants to book, collect:
 - Their full name
 - Their business name (optional)
 - Preferred date and time (Mon-Fri, 9am-5pm CT)
+- Their email address (for confirmation)
 
 Strategy calls are 30 minutes and free. We'll discuss their business and show how Lumera can work for you.
 
@@ -520,6 +590,7 @@ CRITICAL BOOKING RULES:
 - NEVER say the call is confirmed or booked. The backend handles that.
 - Once you have name + time, ask: "Just to confirm — [name] on [date] at [time] CT. Does that work?"
 - Wait for yes/no before anything else.
+- After confirmation, if no email has been provided, ask for it naturally.
 
 == CANCELLING ==
 Ask for their full name. Do not confirm the cancellation yourself.
@@ -1114,8 +1185,12 @@ async def chat(body: LumeraChatMessage):
             booking["business"] = extracted["business"]
             logger.info(f"Extracted business: {booking['business']}")
 
+        if not booking["email"] and extracted.get("email"):
+            booking["email"] = extracted["email"]
+            logger.info(f"Extracted email: {booking['email']}")
+
         if booking["name"]:
-            log_lead(session_id, booking["name"], booking.get("business", ""))
+            log_lead(session_id, booking["name"], booking.get("business", ""), booking.get("email", ""))
 
         if not booking["time_suggestion"] and extracted.get("time_text"):
             dt = extract_time(extracted["time_text"])
@@ -1141,54 +1216,63 @@ async def chat(body: LumeraChatMessage):
 
         # All info collected — check availability then create booking
         if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
-            try:
-                cal_service = get_calendar_service()
+            # Ask for email before finalising if we don't have it yet
+            if not booking["email"]:
+                reply = (
+                    f"Almost done! What's the best email address to send your confirmation to, {booking['name']}?"
+                )
+            else:
+                try:
+                    cal_service = get_calendar_service()
 
-                # ── FIX: verify the slot is actually free before booking ────────
-                if not is_slot_available(cal_service, booking["time"]):
-                    next_slot = find_next_available_open(cal_service, booking["time"])
-                    if next_slot:
-                        booking["time"] = next_slot
-                        booking["time_suggestion"] = next_slot
-                        booking["time_confirmed"] = False  # require re-confirmation
-                        reply = (
-                            f"Sorry, that slot just filled up! The next available time is "
-                            f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
-                            f"Does that work for you?"
-                        )
-                    else:
-                        booking["time"] = None
-                        booking["time_suggestion"] = None
-                        booking["time_confirmed"] = False
-                        reply = (
-                            "That slot isn't available and I couldn't find an opening nearby. "
-                            "Could you suggest a different day or time?"
-                        )
-                # ─────────────────────────────────────────────────────────────
-                else:
-                    create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
-                    log_event("booking_created", session_id)
-                    log_booking(session_id, booking["name"], booking["business"], booking["time"])
-                    try:
-                        with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute(
-                                "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
-                                (session_id, CLIENT_ID)
+                    # ── FIX: verify the slot is actually free before booking ────────
+                    if not is_slot_available(cal_service, booking["time"]):
+                        next_slot = find_next_available_open(cal_service, booking["time"])
+                        if next_slot:
+                            booking["time"] = next_slot
+                            booking["time_suggestion"] = next_slot
+                            booking["time_confirmed"] = False  # require re-confirmation
+                            reply = (
+                                f"Sorry, that slot just filled up! The next available time is "
+                                f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
+                                f"Does that work for you?"
                             )
-                            conn.commit()
-                    except Exception:
-                        pass
-                    time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
-                    reply = (
-                        f"You're all set, {booking['name']}! 🎉 "
-                        f"Your free 30-minute strategy call is booked for {time_str} CT. "
-                        f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
-                    )
-                    session["booking"] = reset_booking()
+                        else:
+                            booking["time"] = None
+                            booking["time_suggestion"] = None
+                            booking["time_confirmed"] = False
+                            reply = (
+                                "That slot isn't available and I couldn't find an opening nearby. "
+                                "Could you suggest a different day or time?"
+                            )
+                    # ─────────────────────────────────────────────────────────────
+                    else:
+                        create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
+                        log_event("booking_created", session_id)
+                        log_booking(session_id, booking["name"], booking["business"], booking["time"])
+                        try:
+                            with sqlite3.connect(DB_PATH) as conn:
+                                conn.execute(
+                                    "UPDATE leads SET status='qualified' WHERE session_id=? AND client_id=?",
+                                    (session_id, CLIENT_ID)
+                                )
+                                conn.commit()
+                        except Exception:
+                            pass
+                        # Send confirmation email
+                        send_booking_confirmation(booking["name"], booking["email"], booking["time"])
+                        time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
+                        reply = (
+                            f"You're all set, {booking['name']}! 🎉 "
+                            f"Your free 30-minute strategy call is booked for {time_str} CT. "
+                            f"A confirmation has been sent to {booking['email']}. "
+                            f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
+                        )
+                        session["booking"] = reset_booking()
 
-            except Exception as e:
-                logger.error(f"Booking error: {e}")
-                reply = "I had trouble saving to the calendar. Please try again in a moment."
+                except Exception as e:
+                    logger.error(f"Booking error: {e}")
+                    reply = "I had trouble saving to the calendar. Please try again in a moment."
 
     # --- AI fallback ---
     if reply is None:
@@ -1198,3 +1282,39 @@ async def chat(body: LumeraChatMessage):
     history.append({"role": "assistant", "content": reply})
 
     return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
+
+
+# ── Cron job: 24hr lead follow-up ─────────────────────────────────────────────
+@app.post("/jobs/lead-followup")
+def job_lead_followup():
+    """Send follow-up emails to leads who chatted ~24hrs ago and never booked.
+    Call this endpoint daily via a cron job (e.g. cron-job.org)."""
+    cutoff_start = (datetime.now(central) - timedelta(hours=25)).isoformat()
+    cutoff_end   = (datetime.now(central) - timedelta(hours=23)).isoformat()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            leads = conn.execute(
+                """SELECT * FROM leads
+                   WHERE client_id = ?
+                   AND status = 'new'
+                   AND email != ''
+                   AND email IS NOT NULL
+                   AND created_at BETWEEN ? AND ?""",
+                (CLIENT_ID, cutoff_start, cutoff_end)
+            ).fetchall()
+        sent = 0
+        for lead in leads:
+            send_lead_followup(lead["name"], lead["email"])
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE leads SET status='contacted' WHERE id=?",
+                    (lead["id"],)
+                )
+                conn.commit()
+            sent += 1
+        logger.info(f"[cron] lead-followup: sent {sent} emails")
+        return {"ok": True, "sent": sent}
+    except Exception as e:
+        logger.error(f"[cron] Lead follow-up job error: {e}")
+        raise HTTPException(status_code=500, detail="Job failed.")
