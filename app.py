@@ -596,7 +596,7 @@ CRITICAL BOOKING RULES:
 Ask for their full name. Do not confirm the cancellation yourself.
 
 == TONE ==
-Warm, confident, conversational. 2-4 sentences max.""" + booking_context
+Warm, confident, conversational. Keep replies to 1-2 sentences max. No paragraphs.""" + booking_context
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -1081,8 +1081,8 @@ async def chat(body: LumeraChatMessage):
                     except Exception:
                         pass
                     reply = (
-                        f"Done! I've cancelled the {chosen['display']} call for "
-                        f"{booking['cancellation_name']}. Feel free to rebook anytime!"
+                        f"Cancelled the {chosen['display']} call for {booking['cancellation_name']}. "
+                        f"Feel free to rebook anytime!"
                     )
                 except Exception as e:
                     logger.error(f"Cancel error: {e}")
@@ -1101,7 +1101,7 @@ async def chat(body: LumeraChatMessage):
                 cal_service = get_calendar_service()
                 matches = find_cancellable_events(cal_service, name)
                 if len(matches) == 0:
-                    reply = f"I couldn't find any upcoming strategy calls for {name}. Could you double-check the name?"
+                    reply = f"No upcoming calls found for {name}. Double-check the name?"
                     booking["cancelling"] = False
                     booking["cancellation_name"] = None
                 elif len(matches) == 1:
@@ -1116,7 +1116,7 @@ async def chat(body: LumeraChatMessage):
                             conn.commit()
                     except Exception:
                         pass
-                    reply = f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                    reply = f"Cancelled! Feel free to rebook anytime, {name}."
                     booking["cancelling"] = False
                     booking["cancellation_name"] = None
                     booking["cancelling_events"] = []
@@ -1124,8 +1124,7 @@ async def chat(body: LumeraChatMessage):
                     booking["cancelling_events"] = matches
                     options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
                     reply = (
-                        f"I found {len(matches)} upcoming calls for {name}. "
-                        f"Which one would you like to cancel?\n{options}"
+                        f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
                     )
             except Exception as e:
                 logger.error(f"Cancel lookup error: {e}")
@@ -1141,7 +1140,7 @@ async def chat(body: LumeraChatMessage):
                     cal_service = get_calendar_service()
                     matches = find_cancellable_events(cal_service, name)
                     if len(matches) == 0:
-                        reply = f"I couldn't find any upcoming strategy calls for {name}. Could you double-check the name?"
+                        reply = f"No upcoming calls found for {name}. Double-check the name?"
                         booking["cancelling"] = False
                         booking["cancellation_name"] = None
                     elif len(matches) == 1:
@@ -1156,7 +1155,7 @@ async def chat(body: LumeraChatMessage):
                                 conn.commit()
                         except Exception:
                             pass
-                        reply = f"Done! I've cancelled the strategy call for {name}. Feel free to rebook anytime!"
+                        reply = f"Cancelled! Feel free to rebook anytime, {name}."
                         booking["cancelling"] = False
                         booking["cancellation_name"] = None
                         booking["cancelling_events"] = []
@@ -1164,14 +1163,13 @@ async def chat(body: LumeraChatMessage):
                         booking["cancelling_events"] = matches
                         options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
                         reply = (
-                            f"I found {len(matches)} upcoming calls for {name}. "
-                            f"Which one would you like to cancel?\n{options}"
+                            f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
                         )
                 except Exception as e:
                     logger.error(f"Cancel error: {e}")
                     reply = "I had trouble accessing the calendar. Please try again."
             else:
-                reply = "Sure! What's the full name the strategy call was booked under?"
+                reply = "What's the full name the call was booked under?"
 
     # --- Booking flow ---
     if reply is None:
@@ -1203,9 +1201,8 @@ async def chat(body: LumeraChatMessage):
                     if next_slot:
                         booking["time_suggestion"] = next_slot
                         reply = (
-                            f"That time is outside our hours (Mon-Fri, 9am-5pm CT). "
-                            f"Next available: {next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
-                            f"Does that work?"
+                            f"That's outside our hours (Mon-Fri, 9am-5pm CT). "
+                            f"Next available: {next_slot.strftime('%A, %B %d at %I:%M %p')} CT. Work for you?"
                         )
 
         confirm_words = ["yes", "yeah", "sure", "ok", "okay", "that works", "sounds good", "perfect", "great", "confirmed", "yep", "yup"]
@@ -1218,9 +1215,7 @@ async def chat(body: LumeraChatMessage):
         if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
             # Ask for email before finalising if we don't have it yet
             if not booking["email"]:
-                reply = (
-                    f"Almost done! What's the best email address to send your confirmation to, {booking['name']}?"
-                )
+                reply = f"What email should I send the confirmation to?"
             else:
                 try:
                     cal_service = get_calendar_service()
@@ -1233,17 +1228,16 @@ async def chat(body: LumeraChatMessage):
                             booking["time_suggestion"] = next_slot
                             booking["time_confirmed"] = False  # require re-confirmation
                             reply = (
-                                f"Sorry, that slot just filled up! The next available time is "
-                                f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. "
-                                f"Does that work for you?"
+                                f"That slot just filled up! Next available: "
+                                f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. Work for you?"
                             )
                         else:
                             booking["time"] = None
                             booking["time_suggestion"] = None
                             booking["time_confirmed"] = False
                             reply = (
-                                "That slot isn't available and I couldn't find an opening nearby. "
-                                "Could you suggest a different day or time?"
+                                "That slot isn't available and I couldn't find a nearby opening. "
+                                "Got another day or time in mind?"
                             )
                     # ─────────────────────────────────────────────────────────────
                     else:
@@ -1263,10 +1257,8 @@ async def chat(body: LumeraChatMessage):
                         send_booking_confirmation(booking["name"], booking["email"], booking["time"])
                         time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                         reply = (
-                            f"You're all set, {booking['name']}! 🎉 "
-                            f"Your free 30-minute strategy call is booked for {time_str} CT. "
-                            f"A confirmation has been sent to {booking['email']}. "
-                            f"We'll walk through your business and show exactly how Lumera can work for you. See you then!"
+                            f"Booked! 🎉 See you {time_str} CT, {booking['name']}. "
+                            f"Confirmation sent to {booking['email']}."
                         )
                         session["booking"] = reset_booking()
 
