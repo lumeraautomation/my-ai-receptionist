@@ -973,9 +973,9 @@ def get_users():
 
 @app.post("/auth/users")
 def create_user(body: UserCreate):
-    valid_roles = {"admin", "staff", "client", "client_staff", "agency"}
+    valid_roles = {"admin", "staff", "client", "client_staff", "agency"}  # ← added agency
     if body.role not in valid_roles:
-        raise HTTPException(status_code=400, detail="role must be admin, staff, client, or client_staff")
+        raise HTTPException(status_code=400, detail="role must be admin, staff, client, client_staff, or agency")
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
@@ -1275,6 +1275,225 @@ async def chat(body: LumeraChatMessage):
 
     return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
 
+
+
+
+# ── Agency endpoints ──────────────────────────────────────────────────────────
+
+def init_agency_tables():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agency_clients (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                agency_email  TEXT NOT NULL,
+                business_name TEXT NOT NULL,
+                contact_name  TEXT,
+                email         TEXT,
+                monthly_plan  REAL NOT NULL DEFAULT 0,
+                status        TEXT NOT NULL DEFAULT 'onboarding',
+                notes         TEXT,
+                start_date    TEXT,
+                created_at    TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agency_prospects (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                agency_email  TEXT NOT NULL,
+                business_name TEXT NOT NULL,
+                contact_name  TEXT,
+                email         TEXT,
+                industry      TEXT,
+                status        TEXT NOT NULL DEFAULT 'new',
+                sent_at       TEXT,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT
+            )
+        """)
+        conn.commit()
+
+init_agency_tables()
+
+
+class AgencyClientCreate(BaseModel):
+    agency_email: str
+    business_name: str
+    contact_name: str | None = None
+    email: str | None = None
+    monthly_plan: float | None = 0
+    status: str | None = "onboarding"
+    notes: str | None = None
+    start_date: str | None = None
+
+class AgencyClientUpdate(BaseModel):
+    status: str | None = None
+    monthly_plan: float | None = None
+    notes: str | None = None
+
+class AgencyProspectCreate(BaseModel):
+    agency_email: str
+    business_name: str
+    contact_name: str | None = None
+    email: str | None = None
+    industry: str | None = None
+    status: str | None = "new"
+
+class AgencyProspectUpdate(BaseModel):
+    status: str | None = None
+    sent_at: str | None = None
+
+class AgencyOutreach(BaseModel):
+    agency_email: str
+    prospect_id: int
+    to_email: str
+    to_name: str | None = None
+    business_name: str | None = None
+    subject: str
+    body: str
+    from_name: str | None = "Lumera Automation"
+
+
+@app.get("/agency/clients")
+def get_agency_clients(agency_email: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM agency_clients WHERE agency_email=? ORDER BY created_at DESC",
+                (agency_email.strip().lower(),)
+            ).fetchall()
+        return {"clients": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Agency clients fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch clients.")
+
+@app.post("/agency/clients")
+def create_agency_client(body: AgencyClientCreate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO agency_clients (agency_email, business_name, contact_name, email,
+                   monthly_plan, status, notes, start_date, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (body.agency_email.strip().lower(), body.business_name,
+                 body.contact_name or "", body.email or "",
+                 body.monthly_plan or 0, body.status or "onboarding",
+                 body.notes or "",
+                 body.start_date or datetime.now(central).strftime("%Y-%m-%d"),
+                 datetime.now(central).isoformat())
+            )
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Agency client create error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create client.")
+
+@app.patch("/agency/clients/{cid}")
+def update_agency_client(cid: int, body: AgencyClientUpdate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for field, val in body.model_dump(exclude_none=True).items():
+                conn.execute(f"UPDATE agency_clients SET {field}=? WHERE id=?", (val, cid))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not update client.")
+
+@app.delete("/agency/clients/{cid}")
+def delete_agency_client(cid: int):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM agency_clients WHERE id=?", (cid,))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not delete client.")
+
+
+@app.get("/agency/prospects")
+def get_agency_prospects(agency_email: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM agency_prospects WHERE agency_email=? ORDER BY created_at DESC",
+                (agency_email.strip().lower(),)
+            ).fetchall()
+        return {"prospects": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Agency prospects fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch prospects.")
+
+@app.post("/agency/prospects")
+def create_agency_prospect(body: AgencyProspectCreate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """INSERT INTO agency_prospects (agency_email, business_name, contact_name, email,
+                   industry, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (body.agency_email.strip().lower(), body.business_name,
+                 body.contact_name or "", body.email or "",
+                 body.industry or "", body.status or "new",
+                 datetime.now(central).isoformat())
+            )
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Agency prospect create error: {e}")
+        raise HTTPException(status_code=500, detail="Could not create prospect.")
+
+@app.patch("/agency/prospects/{pid}")
+def update_agency_prospect(pid: int, body: AgencyProspectUpdate):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if body.status is not None:
+                conn.execute(
+                    "UPDATE agency_prospects SET status=?, updated_at=? WHERE id=?",
+                    (body.status, datetime.now(central).isoformat(), pid)
+                )
+            if body.sent_at is not None:
+                conn.execute("UPDATE agency_prospects SET sent_at=? WHERE id=?", (body.sent_at, pid))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not update prospect.")
+
+@app.delete("/agency/prospects/{pid}")
+def delete_agency_prospect(pid: int):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM agency_prospects WHERE id=?", (pid,))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not delete prospect.")
+
+
+@app.post("/agency/outreach")
+def send_agency_outreach(body: AgencyOutreach):
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Email sending not configured.")
+    resend.api_key = api_key
+    try:
+        resend.Emails.send({
+            "from": f"{body.from_name or 'Lumera Automation'} <{os.getenv('FROM_EMAIL', 'noreply@lumeraautomation.com')}>",
+            "to": body.to_email,
+            "subject": body.subject,
+            "html": f"<div style='font-family:sans-serif;max-width:560px;margin:0 auto;color:#222;white-space:pre-line;'>{body.body}</div>"
+        })
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE agency_prospects SET status='contacted', sent_at=? WHERE id=?",
+                (datetime.now(central).isoformat(), body.prospect_id)
+            )
+            conn.commit()
+        logger.info(f"[agency outreach] Sent to {body.to_email}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"[agency outreach] Failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not send email: {str(e)}")
 
 # ── Cron job: 24hr lead follow-up ─────────────────────────────────────────────
 @app.post("/jobs/lead-followup")
