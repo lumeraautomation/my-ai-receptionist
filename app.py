@@ -973,7 +973,7 @@ def get_users():
 
 @app.post("/auth/users")
 def create_user(body: UserCreate):
-    valid_roles = {"admin", "staff", "client", "client_staff"}
+    valid_roles = {"admin", "staff", "client", "client_staff", "agency"}
     if body.role not in valid_roles:
         raise HTTPException(status_code=400, detail="role must be admin, staff, client, or client_staff")
     try:
