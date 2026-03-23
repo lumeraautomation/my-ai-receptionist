@@ -142,7 +142,6 @@ init_db()
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
 def send_booking_confirmation(name: str, email: str, booking_time: datetime):
-    """Send immediate confirmation email after a booking is created."""
     api_key = os.getenv("RESEND_API_KEY")
     if not api_key or not email:
         return
@@ -172,7 +171,6 @@ def send_booking_confirmation(name: str, email: str, booking_time: datetime):
 
 
 def send_lead_followup(name: str, email: str):
-    """Send a follow-up email to a lead who chatted but never booked."""
     api_key = os.getenv("RESEND_API_KEY")
     if not api_key or not email:
         return
@@ -199,8 +197,6 @@ def send_lead_followup(name: str, email: str):
         logger.info(f"[email] Lead follow-up sent to {email}")
     except Exception as e:
         logger.error(f"[email] Lead follow-up failed: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── Clients table ─────────────────────────────────────────────────────────────
@@ -358,7 +354,7 @@ def reset_booking():
         "time_confirmed": False,
         "cancelling": False,
         "cancellation_name": None,
-        "cancelling_events": []   # holds multiple matches pending user selection
+        "cancelling_events": []
     }
 
 
@@ -416,7 +412,6 @@ def valid_business_hours(dt):
 
 
 def find_next_available(start_dt):
-    """Walk forward until a slot within business hours is found (no calendar check)."""
     dt = start_dt
     for _ in range(200):
         if valid_business_hours(dt):
@@ -429,10 +424,7 @@ def find_next_available(start_dt):
     return None
 
 
-# ── FIX: calendar-aware availability helpers ──────────────────────────────────
-
 def is_slot_available(service, start_dt: datetime) -> bool:
-    """Return True if the 1-hour slot starting at start_dt has no calendar conflicts."""
     end_dt = start_dt + timedelta(hours=1)
     body = {
         "timeMin": start_dt.isoformat(),
@@ -445,8 +437,6 @@ def is_slot_available(service, start_dt: datetime) -> bool:
 
 
 def find_next_available_open(service, start_dt: datetime) -> datetime | None:
-    """Walk forward hour-by-hour until we find a slot that is both in business
-    hours AND has no calendar conflicts."""
     dt = start_dt + timedelta(hours=1)
     for _ in range(200):
         if not valid_business_hours(dt):
@@ -460,8 +450,6 @@ def find_next_available_open(service, start_dt: datetime) -> datetime | None:
             return dt
         dt += timedelta(hours=1)
     return None
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def extract_booking_info_with_ai(message, booking):
@@ -517,7 +505,6 @@ def create_strategy_call_event(service, name, business, booking_time):
 
 
 def find_cancellable_events(service, name):
-    """Return all upcoming events whose summary contains the given name."""
     now = datetime.now(central).isoformat()
     events_result = service.events().list(
         calendarId=CALENDAR_ID, timeMin=now,
@@ -537,7 +524,6 @@ def find_cancellable_events(service, name):
 
 
 def delete_event_by_id(service, event_id):
-    """Delete a single calendar event by ID."""
     service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
 
 
@@ -777,6 +763,7 @@ def delete_lead(lead_id: int):
         raise HTTPException(status_code=500, detail="Could not delete lead.")
 
 
+# ── PATCH 1: Added client_id field to LeadCreate ──────────────────────────────
 class LeadCreate(BaseModel):
     name: str
     business: str | None = None
@@ -784,18 +771,22 @@ class LeadCreate(BaseModel):
     phone: str | None = None
     source: str | None = "Manual Entry"
     status: str | None = "new"
+    client_id: str | None = None  # if provided, scope lead to this client instead of server default
 
+
+# ── PATCH 2: POST /leads now uses body.client_id if provided ──────────────────
 @app.post("/leads")
 def create_lead(body: LeadCreate):
     valid = {"new", "contacted", "qualified", "lost"}
     if body.status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
+    target_client = body.client_id.strip() if body.client_id and body.client_id.strip() else CLIENT_ID
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 """INSERT INTO leads (session_id, client_id, name, business, email, phone, source, status, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), CLIENT_ID, body.name, body.business or "",
+                (str(uuid.uuid4()), target_client, body.name, body.business or "",
                  body.email or "", body.phone or "",
                  body.source or "Manual Entry", body.status,
                  datetime.now(central).isoformat())
@@ -810,6 +801,8 @@ def create_lead(body: LeadCreate):
 class BulkLeadCreate(BaseModel):
     leads: list[LeadCreate]
 
+
+# ── PATCH 3: POST /leads/bulk also uses per-lead client_id if provided ─────────
 @app.post("/leads/bulk")
 def create_leads_bulk(body: BulkLeadCreate):
     if len(body.leads) > 5000:
@@ -825,10 +818,11 @@ def create_leads_bulk(body: BulkLeadCreate):
                     continue
                 valid = {"new", "contacted", "qualified", "lost"}
                 status = lead.status if lead.status in valid else "new"
+                target_client = lead.client_id.strip() if lead.client_id and lead.client_id.strip() else CLIENT_ID
                 conn.execute(
                     """INSERT INTO leads (session_id, client_id, name, business, email, phone, source, status, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), CLIENT_ID, lead.name.strip(),
+                    (str(uuid.uuid4()), target_client, lead.name.strip(),
                      lead.business or "", lead.email or "", lead.phone or "",
                      lead.source or "CSV Import", status, now)
                 )
@@ -973,7 +967,7 @@ def get_users():
 
 @app.post("/auth/users")
 def create_user(body: UserCreate):
-    valid_roles = {"admin", "staff", "client", "client_staff", "agency"}  # ← added agency
+    valid_roles = {"admin", "staff", "client", "client_staff", "agency"}
     if body.role not in valid_roles:
         raise HTTPException(status_code=400, detail="role must be admin, staff, client, client_staff, or agency")
     try:
@@ -1053,12 +1047,10 @@ async def chat(body: LumeraChatMessage):
 
     reply = None
 
-    # --- Cancellation flow ---
     cancel_keywords = ["cancel", "remove my call", "delete my call", "cancel my booking", "cancel my strategy"]
     if any(kw in user_message.lower() for kw in cancel_keywords) or booking.get("cancelling"):
         booking["cancelling"] = True
 
-        # Step 3: user has multiple events pending — they're replying with a choice
         if booking.get("cancelling_events"):
             events = booking["cancelling_events"]
             chosen = None
@@ -1094,7 +1086,6 @@ async def chat(body: LumeraChatMessage):
                 options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(events, start=1))
                 reply = f"Which one would you like to cancel? Just reply with the number:\n{options}"
 
-        # Step 2: we have the name — look up their events on the calendar
         elif booking.get("cancellation_name"):
             name = booking["cancellation_name"]
             try:
@@ -1123,14 +1114,11 @@ async def chat(body: LumeraChatMessage):
                 else:
                     booking["cancelling_events"] = matches
                     options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
-                    reply = (
-                        f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
-                    )
+                    reply = f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
             except Exception as e:
                 logger.error(f"Cancel lookup error: {e}")
                 reply = "I had trouble accessing the calendar. Please try again."
 
-        # Step 1: we don't have a name yet — extract it or ask
         else:
             extracted = extract_booking_info_with_ai(user_message, booking)
             name = extracted.get("name")
@@ -1162,16 +1150,13 @@ async def chat(body: LumeraChatMessage):
                     else:
                         booking["cancelling_events"] = matches
                         options = "\n".join(f"{i}. {e['display']}" for i, e in enumerate(matches, start=1))
-                        reply = (
-                            f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
-                        )
+                        reply = f"Found {len(matches)} calls for {name}. Which to cancel?\n{options}"
                 except Exception as e:
                     logger.error(f"Cancel error: {e}")
                     reply = "I had trouble accessing the calendar. Please try again."
             else:
                 reply = "What's the full name the call was booked under?"
 
-    # --- Booking flow ---
     if reply is None:
         extracted = extract_booking_info_with_ai(user_message, booking)
 
@@ -1211,22 +1196,18 @@ async def chat(body: LumeraChatMessage):
                 booking["time"] = booking["time_suggestion"]
                 booking["time_confirmed"] = True
 
-        # All info collected — check availability then create booking
         if booking["name"] and booking["time"] and booking["time_confirmed"] and reply is None:
-            # Ask for email before finalising if we don't have it yet
             if not booking["email"]:
                 reply = f"What email should I send the confirmation to?"
             else:
                 try:
                     cal_service = get_calendar_service()
-
-                    # ── FIX: verify the slot is actually free before booking ────────
                     if not is_slot_available(cal_service, booking["time"]):
                         next_slot = find_next_available_open(cal_service, booking["time"])
                         if next_slot:
                             booking["time"] = next_slot
                             booking["time_suggestion"] = next_slot
-                            booking["time_confirmed"] = False  # require re-confirmation
+                            booking["time_confirmed"] = False
                             reply = (
                                 f"That slot just filled up! Next available: "
                                 f"{next_slot.strftime('%A, %B %d at %I:%M %p')} CT. Work for you?"
@@ -1239,7 +1220,6 @@ async def chat(body: LumeraChatMessage):
                                 "That slot isn't available and I couldn't find a nearby opening. "
                                 "Got another day or time in mind?"
                             )
-                    # ─────────────────────────────────────────────────────────────
                     else:
                         create_strategy_call_event(cal_service, booking["name"], booking["business"], booking["time"])
                         log_event("booking_created", session_id)
@@ -1253,7 +1233,6 @@ async def chat(body: LumeraChatMessage):
                                 conn.commit()
                         except Exception:
                             pass
-                        # Send confirmation email
                         send_booking_confirmation(booking["name"], booking["email"], booking["time"])
                         time_str = booking["time"].strftime("%A, %B %d at %I:%M %p")
                         reply = (
@@ -1266,7 +1245,6 @@ async def chat(body: LumeraChatMessage):
                     logger.error(f"Booking error: {e}")
                     reply = "I had trouble saving to the calendar. Please try again in a moment."
 
-    # --- AI fallback ---
     if reply is None:
         reply = get_ai_reply(history, booking)
 
@@ -1274,8 +1252,6 @@ async def chat(body: LumeraChatMessage):
     history.append({"role": "assistant", "content": reply})
 
     return {"reply": reply, "session_id": session_id, "booking": session["booking"]}
-
-
 
 
 # ── Agency endpoints ──────────────────────────────────────────────────────────
@@ -1335,6 +1311,7 @@ class AgencyProspectCreate(BaseModel):
     business_name: str
     contact_name: str | None = None
     email: str | None = None
+    phone: str | None = None
     industry: str | None = None
     status: str | None = "new"
 
@@ -1494,6 +1471,7 @@ def send_agency_outreach(body: AgencyOutreach):
     except Exception as e:
         logger.error(f"[agency outreach] Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Could not send email: {str(e)}")
+
 
 # ── Cron job: 24hr lead follow-up ─────────────────────────────────────────────
 @app.post("/jobs/lead-followup")
