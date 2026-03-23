@@ -1279,6 +1279,7 @@ def init_agency_tables():
                 business_name TEXT NOT NULL,
                 contact_name  TEXT,
                 email         TEXT,
+                phone         TEXT,
                 industry      TEXT,
                 status        TEXT NOT NULL DEFAULT 'new',
                 sent_at       TEXT,
@@ -1286,6 +1287,11 @@ def init_agency_tables():
                 updated_at    TEXT
             )
         """)
+        # Add phone column to existing tables that predate this field
+        try:
+            conn.execute("ALTER TABLE agency_prospects ADD COLUMN phone TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 init_agency_tables()
@@ -1407,11 +1413,11 @@ def create_agency_prospect(body: AgencyProspectCreate):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 """INSERT INTO agency_prospects (agency_email, business_name, contact_name, email,
-                   industry, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   phone, industry, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (body.agency_email.strip().lower(), body.business_name,
                  body.contact_name or "", body.email or "",
-                 body.industry or "", body.status or "new",
+                 body.phone or "", body.industry or "", body.status or "new",
                  datetime.now(central).isoformat())
             )
             conn.commit()
