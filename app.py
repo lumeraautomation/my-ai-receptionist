@@ -1513,3 +1513,32 @@ def job_lead_followup():
     except Exception as e:
         logger.error(f"[cron] Lead follow-up job error: {e}")
         raise HTTPException(status_code=500, detail="Job failed.")
+class SendEmailRequest(BaseModel):
+    to: str
+    subject: str
+    body: str
+    from_email: str | None = None
+    fromName: str | None = None
+
+
+@app.post("/send-email")
+def send_email(body: SendEmailRequest):
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Email not configured")
+
+    resend.api_key = api_key
+
+    try:
+        resend.Emails.send({
+            "from": f"{body.fromName or 'Lumera Automation'} <{body.from_email or os.getenv('FROM_EMAIL','noreply@lumeraautomation.com')}>",
+            "to": body.to,
+            "subject": body.subject,
+            "html": f"<div style='font-family:sans-serif'>{body.body}</div>"
+        })
+
+        return {"ok": True}
+
+    except Exception as e:
+        logger.error(f"Send email error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
